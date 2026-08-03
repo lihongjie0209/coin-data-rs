@@ -2,7 +2,6 @@ use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
-use serde_json::Value;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::{
@@ -13,22 +12,8 @@ use crate::{
 
 pub enum Command {
     Records(Vec<Record>),
-    Stats(oneshot::Sender<Result<Value>>),
-    Query {
-        sql: String,
-        response: oneshot::Sender<Result<Value>>,
-    },
     Flush,
     Barrier(oneshot::Sender<Result<()>>),
-    Upload {
-        uploads: Vec<UploadRecord>,
-        response: oneshot::Sender<Result<()>>,
-    },
-    Cleanup {
-        cutoff: DateTime<Utc>,
-        bucket: String,
-        response: oneshot::Sender<Result<usize>>,
-    },
     Shutdown(oneshot::Sender<Result<()>>),
 }
 
@@ -84,16 +69,18 @@ impl Writer {
         result
     }
 
-    pub async fn stats(&self) -> Result<Value> {
-        let (response, result) = oneshot::channel();
-        self.sender.send(Command::Stats(response)).await?;
-        result.await.context("database writer dropped response")?
+    pub async fn stats(&self) -> Result<serde_json::Value> {
+        let database = self.database.clone();
+        tokio::task::spawn_blocking(move || Storage::open(&database)?.stats())
+            .await
+            .context("database stats task failed")?
     }
 
-    pub async fn query(&self, sql: String) -> Result<Value> {
-        let (response, result) = oneshot::channel();
-        self.sender.send(Command::Query { sql, response }).await?;
-        result.await.context("database writer dropped response")?
+    pub async fn query(&self, sql: String) -> Result<serde_json::Value> {
+        let database = self.database.clone();
+        tokio::task::spawn_blocking(move || Storage::open(&database)?.query_json(&sql))
+            .await
+            .context("database query task failed")?
     }
 
     pub async fn export(
@@ -116,23 +103,23 @@ impl Writer {
     }
 
     pub async fn record_uploads(&self, uploads: Vec<UploadRecord>) -> Result<()> {
-        let (response, result) = oneshot::channel();
-        self.sender
-            .send(Command::Upload { uploads, response })
-            .await?;
-        result.await.context("database writer dropped response")?
+        let database = self.database.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut storage = Storage::open(&database)?;
+            storage.record_uploads(&uploads)
+        })
+        .await
+        .context("record uploads task failed")?
     }
 
     pub async fn cleanup(&self, cutoff: DateTime<Utc>, bucket: String) -> Result<usize> {
-        let (response, result) = oneshot::channel();
-        self.sender
-            .send(Command::Cleanup {
-                cutoff,
-                bucket,
-                response,
-            })
-            .await?;
-        result.await.context("database writer dropped response")?
+        let database = self.database.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut storage = Storage::open(&database)?;
+            storage.cleanup(cutoff, &bucket)
+        })
+        .await
+        .context("database cleanup task failed")?
     }
 
     fn observe_queue(&self) {
@@ -163,7 +150,7 @@ fn run(
             Command::Flush => flush(&mut storage, &mut pending, metrics)?,
             other => {
                 flush(&mut storage, &mut pending, metrics)?;
-                if handle(&mut storage, other)? {
+                if handle(other)? {
                     return Ok(());
                 }
             }
@@ -181,14 +168,8 @@ fn flush(storage: &mut Storage, pending: &mut Vec<Record>, metrics: &Metrics) ->
     Ok(())
 }
 
-fn handle(storage: &mut Storage, command: Command) -> Result<bool> {
+fn handle(command: Command) -> Result<bool> {
     match command {
-        Command::Stats(response) => {
-            let _ = response.send(storage.stats());
-        }
-        Command::Query { sql, response } => {
-            let _ = response.send(storage.query_json(&sql));
-        }
         Command::Barrier(response) => {
             let _ = response.send(Ok(()));
         }
@@ -197,16 +178,6 @@ fn handle(storage: &mut Storage, command: Command) -> Result<bool> {
             return Ok(true);
         }
         Command::Flush => {}
-        Command::Upload { uploads, response } => {
-            let _ = response.send(storage.record_uploads(&uploads));
-        }
-        Command::Cleanup {
-            cutoff,
-            bucket,
-            response,
-        } => {
-            let _ = response.send(storage.cleanup(cutoff, &bucket));
-        }
         Command::Records(_) => {}
     }
     Ok(false)
