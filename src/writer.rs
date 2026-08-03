@@ -1,76 +1,75 @@
 use std::{
-    path::PathBuf,
-    sync::{Arc, Condvar, Mutex},
+    path::{Path, PathBuf},
+    sync::Arc,
     time::Duration,
 };
 
 use anyhow::{Context, Result};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Datelike, Timelike, Utc};
 use tokio::sync::{mpsc, oneshot};
 
-use crate::{
-    model::Record,
-    runtime::Metrics,
-    storage::{ExportFile, Storage, UploadRecord},
-};
+use crate::{model::Record, runtime::Metrics, storage::Storage};
 
 pub enum Command {
     Records(Vec<Record>),
     Flush,
-    Barrier(oneshot::Sender<Result<()>>),
-    SnapshotBarrier {
-        ready: oneshot::Sender<Result<()>>,
-        resume: Arc<(Mutex<bool>, Condvar)>,
-    },
-    Shutdown(oneshot::Sender<Result<()>>),
+    Rotate(DateTime<Utc>),
     Stats(oneshot::Sender<Result<serde_json::Value>>),
     Query {
         sql: String,
         response: oneshot::Sender<Result<serde_json::Value>>,
     },
-    Upload {
-        uploads: Vec<UploadRecord>,
-        response: oneshot::Sender<Result<()>>,
-    },
-    Cleanup {
-        cutoff: DateTime<Utc>,
-        bucket: String,
-        response: oneshot::Sender<Result<usize>>,
-    },
 }
 
-struct SnapshotResumeGuard(Arc<(Mutex<bool>, Condvar)>);
-
-impl Drop for SnapshotResumeGuard {
-    fn drop(&mut self) {
-        resume_snapshot_writer(&self.0);
-    }
+#[derive(Debug, Clone)]
+pub struct ClosedDatabase {
+    pub hour: DateTime<Utc>,
+    pub path: PathBuf,
 }
 
 #[derive(Clone)]
 pub struct Writer {
     sender: mpsc::Sender<Command>,
-    database: PathBuf,
     metrics: Arc<Metrics>,
+    directory: PathBuf,
+    exchange: String,
 }
 
 impl Writer {
     pub fn start(
         database: PathBuf,
+        exchange: String,
         capacity: usize,
         batch_size: usize,
         flush_interval: Duration,
         metrics: Arc<Metrics>,
-    ) -> Result<Self> {
-        Storage::open(&database).context("initialize database")?;
+    ) -> Result<(Self, mpsc::UnboundedReceiver<ClosedDatabase>)> {
+        let directory = database
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join(&exchange);
+        std::fs::create_dir_all(&directory).context("create hourly database directory")?;
+        let hour = floor_hour(Utc::now())?;
+        prepare_database(&hourly_path(&directory, hour))?;
+        prepare_database(&hourly_path(&directory, hour + chrono::Duration::hours(1)))?;
+
         let (sender, receiver) = mpsc::channel(capacity);
-        let writer_database = database.clone();
-        let writer_metrics = Arc::clone(&metrics);
+        let (closed_sender, closed_receiver) = mpsc::unbounded_channel();
+        let run_directory = directory.clone();
+        let run_metrics = Arc::clone(&metrics);
         tokio::task::spawn_blocking(move || {
-            if let Err(error) = run(database, receiver, batch_size, &writer_metrics) {
-                tracing::error!(%error, "database writer stopped");
+            if let Err(error) = run(
+                run_directory,
+                hour,
+                receiver,
+                closed_sender,
+                batch_size,
+                &run_metrics,
+            ) {
+                tracing::error!(error = %format!("{error:#}"), "database writer stopped");
             }
         });
+
         let flush_sender = sender.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(flush_interval);
@@ -82,11 +81,29 @@ impl Writer {
                 }
             }
         });
-        Ok(Self {
-            sender,
-            database: writer_database,
-            metrics,
-        })
+        let rotate_sender = sender.clone();
+        tokio::spawn(async move {
+            loop {
+                let now = Utc::now();
+                let Ok(current) = floor_hour(now) else { return };
+                let next = current + chrono::Duration::hours(1);
+                let wait = (next - now).to_std().unwrap_or_default();
+                tokio::time::sleep(wait).await;
+                if rotate_sender.send(Command::Rotate(next)).await.is_err() {
+                    return;
+                }
+            }
+        });
+
+        Ok((
+            Self {
+                sender,
+                metrics,
+                directory,
+                exchange,
+            },
+            closed_receiver,
+        ))
     }
 
     pub async fn records(&self, records: Vec<Record>) -> Result<()> {
@@ -103,89 +120,23 @@ impl Writer {
     pub async fn stats(&self) -> Result<serde_json::Value> {
         let (response, result) = oneshot::channel();
         self.sender.send(Command::Stats(response)).await?;
-        result
-            .await
-            .context("database maintenance dropped response")?
+        result.await.context("database writer dropped response")?
     }
 
     pub async fn query(&self, sql: String) -> Result<serde_json::Value> {
         let (response, result) = oneshot::channel();
         self.sender.send(Command::Query { sql, response }).await?;
-        result
-            .await
-            .context("database maintenance dropped response")?
+        result.await.context("database writer dropped response")?
     }
 
-    pub async fn export(
-        &self,
-        start: DateTime<Utc>,
-        end: DateTime<Utc>,
-        directory: PathBuf,
-        force: bool,
-    ) -> Result<Vec<ExportFile>> {
-        let database = self.database.clone();
-        let (writer_ready_tx, writer_ready_rx) = oneshot::channel();
-        let resume_writer = Arc::new((Mutex::new(false), Condvar::new()));
-        self.sender
-            .send(Command::SnapshotBarrier {
-                ready: writer_ready_tx,
-                resume: Arc::clone(&resume_writer),
-            })
-            .await
-            .map_err(|_| anyhow::anyhow!("database writer stopped"))?;
-        let resume_guard = SnapshotResumeGuard(resume_writer);
-        writer_ready_rx
-            .await
-            .context("database writer dropped snapshot barrier")??;
-
-        let snapshot = database.with_extension(format!(
-            "export-{}-{}.duckdb",
-            std::process::id(),
-            Utc::now().timestamp_millis()
-        ));
-        let source = database.clone();
-        let target = snapshot.clone();
-        tokio::task::spawn_blocking(move || std::fs::copy(&source, &target))
-            .await
-            .context("DuckDB snapshot copy task failed")?
-            .context("copy DuckDB export snapshot")?;
-        drop(resume_guard);
-
-        tokio::task::spawn_blocking(move || {
-            let mut storage = Storage::open_existing(&snapshot)?;
-            let result = storage.export_hour(start, end, &directory, force);
-            drop(storage);
-            if let Err(error) = std::fs::remove_file(&snapshot) {
-                tracing::warn!(path = %snapshot.display(), %error, "remove export snapshot failed");
-            }
-            result
-        })
-        .await
-        .context("Parquet export task failed")?
+    pub fn database_path(&self, hour: DateTime<Utc>) -> PathBuf {
+        hourly_path(&self.directory, hour)
     }
-
-    pub async fn record_uploads(&self, uploads: Vec<UploadRecord>) -> Result<()> {
-        let (response, result) = oneshot::channel();
-        self.sender
-            .send(Command::Upload { uploads, response })
-            .await?;
-        result
-            .await
-            .context("database maintenance dropped response")?
+    pub fn directory(&self) -> &Path {
+        &self.directory
     }
-
-    pub async fn cleanup(&self, cutoff: DateTime<Utc>, bucket: String) -> Result<usize> {
-        let (response, result) = oneshot::channel();
-        self.sender
-            .send(Command::Cleanup {
-                cutoff,
-                bucket,
-                response,
-            })
-            .await?;
-        result
-            .await
-            .context("database maintenance dropped response")?
+    pub fn exchange(&self) -> &str {
+        &self.exchange
     }
 
     fn observe_queue(&self) {
@@ -198,12 +149,14 @@ impl Writer {
 }
 
 fn run(
-    database: PathBuf,
+    directory: PathBuf,
+    mut hour: DateTime<Utc>,
     mut receiver: mpsc::Receiver<Command>,
+    closed_sender: mpsc::UnboundedSender<ClosedDatabase>,
     batch_size: usize,
     metrics: &Metrics,
 ) -> Result<()> {
-    let mut storage = Storage::open_existing(&database)?;
+    let mut storage = Storage::open_existing(&hourly_path(&directory, hour))?;
     let mut pending = Vec::with_capacity(batch_size);
     while let Some(command) = receiver.blocking_recv() {
         match command {
@@ -214,11 +167,41 @@ fn run(
                 }
             }
             Command::Flush => flush(&mut storage, &mut pending, batch_size, metrics)?,
-            other => {
-                flush(&mut storage, &mut pending, batch_size, metrics)?;
-                if handle(&mut storage, other)? {
-                    return Ok(());
+            Command::Rotate(next_hour) => {
+                if next_hour <= hour {
+                    continue;
                 }
+                flush(&mut storage, &mut pending, batch_size, metrics)?;
+                storage.checkpoint()?;
+                drop(storage);
+                let closed = ClosedDatabase {
+                    hour,
+                    path: hourly_path(&directory, hour),
+                };
+                prepare_database(&hourly_path(&directory, next_hour))?;
+                prepare_database(&hourly_path(
+                    &directory,
+                    next_hour + chrono::Duration::hours(1),
+                ))?;
+                storage = Storage::open_existing(&hourly_path(&directory, next_hour))?;
+                hour = next_hour;
+                let _ = closed_sender.send(closed);
+            }
+            Command::Stats(response) => {
+                flush(&mut storage, &mut pending, batch_size, metrics)?;
+                let mut stats = storage.stats()?;
+                if let Some(object) = stats.as_object_mut() {
+                    object.insert("hour".to_owned(), hour.to_rfc3339().into());
+                    object.insert(
+                        "path".to_owned(),
+                        hourly_path(&directory, hour).display().to_string().into(),
+                    );
+                }
+                let _ = response.send(Ok(stats));
+            }
+            Command::Query { sql, response } => {
+                flush(&mut storage, &mut pending, batch_size, metrics)?;
+                let _ = response.send(storage.query_json(&sql));
             }
         }
     }
@@ -242,50 +225,64 @@ fn flush(
     Ok(())
 }
 
-fn handle(storage: &mut Storage, command: Command) -> Result<bool> {
-    match command {
-        Command::Barrier(response) => {
-            let _ = response.send(Ok(()));
-        }
-        Command::SnapshotBarrier { ready, resume } => {
-            let _ = ready.send(storage.checkpoint());
-            let (lock, condition) = &*resume;
-            let mut resumed = lock.lock().unwrap_or_else(|error| error.into_inner());
-            while !*resumed {
-                resumed = condition
-                    .wait(resumed)
-                    .unwrap_or_else(|error| error.into_inner());
-            }
-        }
-        Command::Shutdown(response) => {
-            let _ = response.send(Ok(()));
-            return Ok(true);
-        }
-        Command::Flush => {}
-        Command::Records(_) => {}
-        Command::Stats(response) => {
-            let _ = response.send(storage.stats());
-        }
-        Command::Query { sql, response } => {
-            let _ = response.send(storage.query_json(&sql));
-        }
-        Command::Upload { uploads, response } => {
-            let _ = response.send(storage.record_uploads(&uploads));
-        }
-        Command::Cleanup {
-            cutoff,
-            bucket,
-            response,
-        } => {
-            let _ = response.send(storage.cleanup(cutoff, &bucket));
-        }
+fn prepare_database(path: &Path) -> Result<()> {
+    if !path.exists() {
+        drop(Storage::open(path)?);
     }
-    Ok(false)
+    Ok(())
 }
 
-fn resume_snapshot_writer(resume: &Arc<(Mutex<bool>, Condvar)>) {
-    let (lock, condition) = &**resume;
-    let mut resumed = lock.lock().unwrap_or_else(|error| error.into_inner());
-    *resumed = true;
-    condition.notify_one();
+pub fn floor_hour(value: DateTime<Utc>) -> Result<DateTime<Utc>> {
+    value
+        .with_minute(0)
+        .and_then(|v| v.with_second(0))
+        .and_then(|v| v.with_nanosecond(0))
+        .context("invalid UTC hour")
+}
+
+pub fn hourly_path(directory: &Path, hour: DateTime<Utc>) -> PathBuf {
+    directory
+        .join(format!(
+            "{:04}-{:02}-{:02}",
+            hour.year(),
+            hour.month(),
+            hour.day()
+        ))
+        .join(format!("{:02}.duckdb", hour.hour()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[tokio::test]
+    async fn rotation_closes_current_and_prepares_following_hour() -> Result<()> {
+        let temporary = tempdir()?;
+        let database = temporary.path().join("market.duckdb");
+        let metrics = Arc::new(Metrics::default());
+        let (writer, mut closed) = Writer::start(
+            database,
+            "binance".to_owned(),
+            10,
+            10,
+            Duration::from_secs(60),
+            metrics,
+        )?;
+        let current = floor_hour(Utc::now())?;
+        let next = current + chrono::Duration::hours(1);
+        writer.sender.send(Command::Rotate(next)).await?;
+        let item = tokio::time::timeout(Duration::from_secs(5), closed.recv())
+            .await?
+            .context("rotation notification missing")?;
+        assert_eq!(item.hour, current);
+        assert!(item.path.is_file());
+        assert!(writer.database_path(next).is_file());
+        assert!(
+            writer
+                .database_path(next + chrono::Duration::hours(1))
+                .is_file()
+        );
+        Ok(())
+    }
 }

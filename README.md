@@ -1,14 +1,14 @@
 # coin-data-rs
 
-Rust implementation of a Binance Spot, USDⓈ-M, and COIN-M real-time market-data collector. One process supervises all three markets while each market retains an independent DuckDB file. It consumes sharded WebSocket streams, stores documented fields in structured tables, exports hourly Parquet files, and uploads them to S3.
+Rust implementation of a Binance Spot, USDⓈ-M, and COIN-M real-time market-data collector. One process supervises all three markets and writes one DuckDB file per exchange per UTC hour. It consumes sharded WebSocket streams, stores documented fields in structured tables, and uploads each closed hourly database directly to S3.
 
 DuckDB is dynamically linked. Release archives contain the matching `libduckdb.so`; install it under `/usr/local/lib/coin-data-rs` (the systemd unit sets `LD_LIBRARY_PATH`). The server does not need GCC or a Rust toolchain.
 
 The receiver and database writer are separated by a bounded asynchronous channel. DuckDB writes run
-on a dedicated blocking thread. Export uses a checkpointed snapshot so live ingestion resumes while
-Parquet files are generated and uploaded. Live ingestion never writes Parquet parts directly. Each
-dataset connection is limited to 160 MiB and may spill analytical work to disk; the bounded writer
-queue prevents an extended database stall from exhausting host memory.
+on one dedicated blocking thread. The following hour's database is initialized in advance; at the
+hour boundary the writer flushes and checkpoints the old file, switches to the prepared file, and
+hands the closed file to the asynchronous S3 uploader. The connection is limited to 160 MiB and the
+bounded writer queue prevents an extended database stall from exhausting host memory.
 
 ## Run
 
@@ -17,13 +17,13 @@ cargo run --release -- \
   --database data/market.duckdb
 ```
 
-Use `--help` for all settings. By default the process runs `spot`, `usdm`, and `coinm` together and creates `binance-spot.duckdb`, `binance-usdm.duckdb`, and `binance-coinm.duckdb` next to the `--database` path. Set `--all-markets=false --market usdm` to run one market only. The default `--symbols ALL` discovers all currently tradable instruments in each market. The desired connection count defaults to four per market and is automatically increased when Binance's 1024-stream limit requires it. USDⓈ-M high-frequency public streams and regular market streams are routed to their separate endpoints.
+Use `--help` for all settings. By default the process runs `spot`, `usdm`, and `coinm` together. All markets for one exchange share one hourly DuckDB file under `<database parent>/binance/YYYY-MM-DD/HH.duckdb`; the next hour is prepared in advance and the writer switches files at the UTC hour boundary. Closed files are uploaded directly to S3 as `<prefix>/binance/YYYY-MM-DD/HH.duckdb`, without a Parquet conversion step. Set `--all-markets=false --market usdm` to run one market only. The default `--symbols ALL` discovers all currently tradable instruments in each market. The desired connection count defaults to four per market and is automatically increased when Binance's 1024-stream limit requires it. USDⓈ-M high-frequency public streams and regular market streams are routed to their separate endpoints.
 
 Aggregate trades come only from real-time WebSocket streams; REST historical backfill is disabled.
 Futures open interest is sampled once per minute and shares a global Binance REST backoff after
 HTTP 418 or 429 responses.
 
-Local structured data is normally retained for at most eight hours. When free disk falls below 20%, uploaded rows older than four hours are reclaimed; data inside the four-hour safety window is never pressure-deleted. All three thresholds are configurable.
+Uploaded hourly DuckDB files are normally retained locally for at most eight hours. When free disk falls below 20%, uploaded files older than four hours are deleted early; active, future, unuploaded, and files inside the four-hour safety window are never pressure-deleted. All three thresholds are configurable.
 
 ## API
 
@@ -42,14 +42,14 @@ curl -X POST http://127.0.0.1:8081/v1/archive \
 
 The SQL endpoint intentionally accepts arbitrary SQL and must remain private.
 
-Hourly Parquet objects use exchange, market, symbol, table, date, and hour:
+Hourly DuckDB objects use exchange, date, and hour:
 
 ```text
-parquet/rust/binance/usdm/BTCUSDT/futures_aggregate_trades/2026-08-03/04/data.parquet
+duckdb/rust/binance/2026-08-03/04.duckdb
 ```
 
-Only table/symbol/hour partitions containing rows produce files. Every source field, including
-`symbol`, remains present in each Parquet file.
+The single file contains all spot, USD-M, and COIN-M tables for the hour. Market-specific `source`
+values distinguish the feeds while all structured fields remain queryable in DuckDB.
 
 Set `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` to receive a success or failure report after every
 automatic or manually triggered archive. Reports include file count, bytes, duration, collector

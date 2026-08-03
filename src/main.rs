@@ -24,10 +24,30 @@ async fn main() -> Result<()> {
         .init();
 
     let root_config = Config::parse();
+    let metrics = Arc::new(Metrics::default());
+    let (writer, closed_databases) = Writer::start(
+        root_config.database.clone(),
+        root_config.exchange.as_str().to_owned(),
+        root_config.queue_capacity,
+        root_config.batch_size,
+        root_config.flush_interval(),
+        Arc::clone(&metrics),
+    )?;
+    let notifier = TelegramNotifier::from_env(
+        Arc::clone(&metrics),
+        root_config.exchange.as_str().to_owned(),
+    );
+    let archiver = Arc::new(Archiver::new(&root_config, writer.clone(), notifier).await);
+    Arc::clone(&archiver).spawn(closed_databases);
     let mut datasets = BTreeMap::new();
     for config in root_config.dataset_configs() {
         let name = config.market.as_str().to_owned();
-        let state = start_dataset(config).await?;
+        start_dataset(config, writer.clone(), Arc::clone(&metrics)).await?;
+        let state = DatasetState {
+            writer: writer.clone(),
+            metrics: Arc::clone(&metrics),
+            archiver: Arc::clone(&archiver),
+        };
         datasets.insert(name, state);
     }
     let state = ApiState {
@@ -43,7 +63,7 @@ async fn main() -> Result<()> {
         .context("serve API")
 }
 
-async fn start_dataset(config: Config) -> Result<DatasetState> {
+async fn start_dataset(config: Config, writer: Writer, metrics: Arc<Metrics>) -> Result<()> {
     let symbols = config.resolve_symbols().await?;
     config.validate(&symbols)?;
     tracing::info!(
@@ -52,18 +72,6 @@ async fn start_dataset(config: Config) -> Result<DatasetState> {
         symbols = symbols.len(),
         connections = config.connection_count(symbols.len()),
         "symbol universe resolved"
-    );
-    let metrics = Arc::new(Metrics::default());
-    let writer = Writer::start(
-        config.database.clone(),
-        config.queue_capacity,
-        config.batch_size,
-        config.flush_interval(),
-        Arc::clone(&metrics),
-    )?;
-    let notifier = TelegramNotifier::from_env(
-        Arc::clone(&metrics),
-        format!("{}/{}", config.exchange.as_str(), config.market.as_str()),
     );
     if config.exchange == coin_data_rs::config::Exchange::Binance
         && config.market != coin_data_rs::config::Market::Spot
@@ -76,9 +84,6 @@ async fn start_dataset(config: Config) -> Result<DatasetState> {
         )
         .spawn();
     }
-    let archiver = Arc::new(Archiver::new(&config, writer.clone(), notifier).await);
-    Arc::clone(&archiver).spawn_hourly();
-
     let mut shard_id = 0;
     let groups = config.stream_groups();
     let connection_counts = config.connection_counts(symbols.len());
@@ -97,11 +102,7 @@ async fn start_dataset(config: Config) -> Result<DatasetState> {
         }
     }
 
-    Ok(DatasetState {
-        writer,
-        metrics,
-        archiver,
-    })
+    Ok(())
 }
 
 async fn shutdown() {

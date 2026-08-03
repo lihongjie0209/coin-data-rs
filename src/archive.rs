@@ -1,16 +1,23 @@
-use std::{path::PathBuf, sync::Arc, time::Instant};
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Instant,
+};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use aws_config::{BehaviorVersion, Region};
-use aws_sdk_s3::{Client, primitives::ByteStream};
-use chrono::{DateTime, Timelike, Utc};
-use futures_util::{StreamExt, TryStreamExt, stream};
+use aws_sdk_s3::{
+    Client,
+    primitives::{ByteStream, Length},
+    types::{CompletedMultipartUpload, CompletedPart},
+};
+use chrono::{DateTime, Datelike, Timelike, Utc};
+use tokio::sync::mpsc;
 
 use crate::{
     config::Config,
     notify::{ArchiveNotification, TelegramNotifier},
-    storage::UploadRecord,
-    writer::Writer,
+    writer::{ClosedDatabase, Writer, floor_hour},
 };
 
 #[derive(Clone)]
@@ -19,13 +26,11 @@ pub struct Archiver {
     client: Client,
     bucket: String,
     prefix: String,
-    directory: PathBuf,
     min_retention_hours: u64,
     max_retention_hours: u64,
     min_free_disk_percent: u64,
     notifier: TelegramNotifier,
-    export_lock: Arc<tokio::sync::Mutex<()>>,
-    archive_minute: u32,
+    upload_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl Archiver {
@@ -38,192 +43,275 @@ impl Archiver {
             writer,
             client: Client::new(&sdk),
             bucket: config.s3_bucket.clone(),
-            prefix: config.dataset_s3_prefix(),
-            directory: config.dataset_parquet_dir(),
+            prefix: format!(
+                "{}/{}",
+                config.s3_prefix.trim_matches('/'),
+                config.exchange.as_str()
+            ),
             min_retention_hours: config.min_retention_hours,
             max_retention_hours: config.max_retention_hours,
             min_free_disk_percent: config.min_free_disk_percent,
             notifier,
-            export_lock: Arc::new(tokio::sync::Mutex::new(())),
-            archive_minute: config.archive_minute(),
+            upload_lock: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
-    pub async fn export(&self, start: DateTime<Utc>, force: bool) -> Result<Vec<String>> {
-        let _guard = self.export_lock.lock().await;
-        let started = Instant::now();
-        let result = self.export_inner(start, force).await;
-        let (status, files, bytes, error) = match &result {
-            Ok(report) => ("SUCCESS", report.keys.len(), report.bytes, None),
-            Err(error) => ("FAILED", 0, 0, Some(error)),
-        };
-        if let Err(error) = self
-            .notifier
-            .send_archive_report(ArchiveNotification {
-                status,
-                hour: start.format("%Y-%m-%d %H:00 UTC").to_string(),
-                files,
-                bytes,
-                elapsed_seconds: started.elapsed().as_secs_f64(),
-                error,
-                data_directory: &self.directory,
-            })
-            .await
-        {
-            tracing::warn!(%error, "Telegram archive notification failed");
-        }
-        result.map(|report| report.keys)
-    }
-
-    async fn export_inner(&self, start: DateTime<Utc>, force: bool) -> Result<ArchiveReport> {
-        std::fs::create_dir_all(&self.directory).context("create parquet directory")?;
-        self.cleanup().await?;
-        let start = start
-            .with_minute(0)
-            .and_then(|value| value.with_second(0))
-            .and_then(|value| value.with_nanosecond(0))
-            .context("invalid archive hour")?;
-        let end = start + chrono::Duration::hours(1);
-        let files = self
-            .writer
-            .export(start, end, self.directory.clone(), force)
-            .await?;
-        let uploads = stream::iter(files.into_iter().map(|file| self.upload_file(file, start)))
-            .buffer_unordered(8)
-            .try_collect::<Vec<_>>()
-            .await?;
-        let keys = uploads
-            .iter()
-            .map(|upload| upload.key.clone())
-            .collect::<Vec<_>>();
-        let bytes = uploads.iter().map(|upload| upload.size).sum();
-        self.writer
-            .record_uploads(uploads)
-            .await
-            .context("record Parquet uploads")?;
-        self.cleanup().await.context("post-upload cleanup")?;
-        Ok(ArchiveReport { keys, bytes })
-    }
-
-    async fn upload_file(
-        &self,
-        file: crate::storage::ExportFile,
-        start: DateTime<Utc>,
-    ) -> Result<UploadRecord> {
-        let relative = file
-            .path
-            .strip_prefix(&self.directory)
-            .context("parquet file is outside archive directory")?;
-        let key = format!("{}/{}", self.prefix, relative.to_string_lossy());
-        let body = ByteStream::from_path(&file.path)
-            .await
-            .context("read parquet file")?;
-        let output = self
-            .client
-            .put_object()
-            .bucket(&self.bucket)
-            .key(&key)
-            .body(body)
-            .send()
-            .await?;
-        self.client
-            .head_object()
-            .bucket(&self.bucket)
-            .key(&key)
-            .send()
-            .await?;
-        let size = std::fs::metadata(&file.path)?.len();
-        Ok(UploadRecord {
-            table: file.table,
-            symbol: file.symbol,
-            start,
-            bucket: self.bucket.clone(),
-            key,
-            etag: output.e_tag().unwrap_or_default().to_owned(),
-            size,
-        })
-    }
-
-    async fn cleanup(&self) -> Result<()> {
-        let total = fs2::total_space(&self.directory)?;
-        let available = fs2::available_space(&self.directory)?;
-        let free_percent = available
-            .saturating_mul(100)
-            .checked_div(total)
-            .unwrap_or(100);
-        let hours = if free_percent < self.min_free_disk_percent {
-            self.min_retention_hours
-        } else {
-            self.max_retention_hours
-        };
-        let cutoff = Utc::now() - chrono::Duration::hours(i64::try_from(hours)?);
-        let deleted = self.writer.cleanup(cutoff, self.bucket.clone()).await?;
-        if deleted > 0 {
-            tracing::info!(
-                deleted,
-                free_percent,
-                retention_hours = hours,
-                "cleaned uploaded rows"
-            );
-        }
-        Ok(())
-    }
-
-    pub fn spawn_hourly(self: Arc<Self>) {
+    pub fn spawn(self: Arc<Self>, mut closed: mpsc::UnboundedReceiver<ClosedDatabase>) {
         tokio::spawn(async move {
+            let mut scan = tokio::time::interval(std::time::Duration::from_secs(60));
             loop {
-                let now = Utc::now();
-                let next = now
-                    .with_minute(self.archive_minute)
-                    .and_then(|value| value.with_second(0))
-                    .and_then(|value| value.with_nanosecond(0))
-                    .map(|value| {
-                        if value <= now {
-                            value + chrono::Duration::hours(1)
-                        } else {
-                            value
-                        }
-                    });
-                let Some(next) = next else { return };
-                let wait =
-                    (next - now).to_std().unwrap_or_default() + std::time::Duration::from_secs(5);
-                tokio::time::sleep(wait).await;
-                let hour = (next - chrono::Duration::hours(1))
-                    .with_minute(0)
-                    .and_then(|value| value.with_second(0))
-                    .and_then(|value| value.with_nanosecond(0));
-                let Some(hour) = hour else { continue };
-                let mut attempt = 1;
-                loop {
-                    match self.export(hour, false).await {
-                        Ok(_) => break,
-                        Err(error) if attempt < 4 => {
-                            tracing::warn!(
-                                error = %format!("{error:#}"),
-                                %hour,
-                                attempt,
-                                "hourly archive will retry"
-                            );
-                            attempt += 1;
-                            tokio::time::sleep(std::time::Duration::from_secs(120)).await;
-                        }
-                        Err(error) => {
-                            tracing::error!(
-                                error = %format!("{error:#}"),
-                                %hour,
-                                attempt,
-                                "hourly archive retries exhausted"
-                            );
-                            break;
+                tokio::select! {
+                    item = closed.recv() => match item {
+                        Some(item) => self.upload_with_retry(item).await,
+                        None => return,
+                    },
+                    _ = scan.tick() => {
+                        if let Err(error) = self.upload_pending().await {
+                            tracing::warn!(error = %format!("{error:#}"), "scan hourly databases failed");
                         }
                     }
                 }
             }
         });
     }
+
+    pub async fn export(&self, hour: DateTime<Utc>, force: bool) -> Result<Vec<String>> {
+        let hour = floor_hour(hour)?;
+        if hour >= floor_hour(Utc::now())? {
+            bail!("the active hour cannot be uploaded");
+        }
+        let item = ClosedDatabase {
+            hour,
+            path: self.writer.database_path(hour),
+        };
+        Ok(vec![self.upload(item, force).await?])
+    }
+
+    async fn upload_with_retry(&self, item: ClosedDatabase) {
+        for attempt in 1..=4 {
+            match self.upload(item.clone(), false).await {
+                Ok(_) => return,
+                Err(error) if attempt < 4 => {
+                    tracing::warn!(error = %format!("{error:#}"), attempt, path = %item.path.display(), "DuckDB upload will retry");
+                    tokio::time::sleep(std::time::Duration::from_secs(120)).await;
+                }
+                Err(error) => {
+                    tracing::error!(error = %format!("{error:#}"), path = %item.path.display(), "DuckDB upload retries exhausted")
+                }
+            }
+        }
+    }
+
+    async fn upload(&self, item: ClosedDatabase, force: bool) -> Result<String> {
+        let _guard = self.upload_lock.lock().await;
+        if !item.path.is_file() {
+            bail!("hourly database does not exist: {}", item.path.display());
+        }
+        let marker = item.path.with_extension("duckdb.uploaded");
+        if marker.exists() && !force {
+            return Ok(std::fs::read_to_string(marker)?.trim().to_owned());
+        }
+        let started = Instant::now();
+        let key = format!(
+            "{}/{:04}-{:02}-{:02}/{:02}.duckdb",
+            self.prefix,
+            item.hour.year(),
+            item.hour.month(),
+            item.hour.day(),
+            item.hour.hour()
+        );
+        let result = async {
+            self.upload_object(&item.path, &key).await?;
+            self.client
+                .head_object()
+                .bucket(&self.bucket)
+                .key(&key)
+                .send()
+                .await?;
+            std::fs::write(&marker, format!("{key}\n")).context("write upload marker")?;
+            self.cleanup()?;
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        let size = std::fs::metadata(&item.path)
+            .map(|value| value.len())
+            .unwrap_or_default();
+        let status = if result.is_ok() { "SUCCESS" } else { "FAILED" };
+        if let Err(error) = self
+            .notifier
+            .send_archive_report(ArchiveNotification {
+                status,
+                hour: item.hour.format("%Y-%m-%d %H:00 UTC").to_string(),
+                files: usize::from(result.is_ok()),
+                bytes: if result.is_ok() { size } else { 0 },
+                elapsed_seconds: started.elapsed().as_secs_f64(),
+                error: result.as_ref().err(),
+                data_directory: self.writer.directory(),
+            })
+            .await
+        {
+            tracing::warn!(%error, "Telegram archive notification failed");
+        }
+        result?;
+        Ok(key)
+    }
+
+    async fn upload_object(&self, path: &Path, key: &str) -> Result<()> {
+        const PART_SIZE: u64 = 64 * 1_024 * 1_024;
+        let size = std::fs::metadata(path)?.len();
+        if size <= PART_SIZE {
+            let body = ByteStream::from_path(path)
+                .await
+                .context("read hourly DuckDB")?;
+            self.client
+                .put_object()
+                .bucket(&self.bucket)
+                .key(key)
+                .body(body)
+                .send()
+                .await?;
+            return Ok(());
+        }
+
+        let created = self
+            .client
+            .create_multipart_upload()
+            .bucket(&self.bucket)
+            .key(key)
+            .send()
+            .await?;
+        let upload_id = created
+            .upload_id()
+            .context("S3 omitted multipart upload ID")?;
+        let result = async {
+            let mut parts = Vec::new();
+            let mut offset = 0;
+            let mut part_number = 1;
+            while offset < size {
+                let length = PART_SIZE.min(size - offset);
+                let body = ByteStream::read_from()
+                    .path(path)
+                    .offset(offset)
+                    .length(Length::Exact(length))
+                    .build()
+                    .await?;
+                let uploaded = self
+                    .client
+                    .upload_part()
+                    .bucket(&self.bucket)
+                    .key(key)
+                    .upload_id(upload_id)
+                    .part_number(part_number)
+                    .body(body)
+                    .send()
+                    .await?;
+                parts.push(
+                    CompletedPart::builder()
+                        .part_number(part_number)
+                        .set_e_tag(uploaded.e_tag().map(str::to_owned))
+                        .build(),
+                );
+                offset += length;
+                part_number += 1;
+            }
+            self.client
+                .complete_multipart_upload()
+                .bucket(&self.bucket)
+                .key(key)
+                .upload_id(upload_id)
+                .multipart_upload(
+                    CompletedMultipartUpload::builder()
+                        .set_parts(Some(parts))
+                        .build(),
+                )
+                .send()
+                .await?;
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        if result.is_err()
+            && let Err(error) = self
+                .client
+                .abort_multipart_upload()
+                .bucket(&self.bucket)
+                .key(key)
+                .upload_id(upload_id)
+                .send()
+                .await
+        {
+            tracing::warn!(%error, %key, "abort multipart upload failed");
+        }
+        result
+    }
+
+    async fn upload_pending(&self) -> Result<()> {
+        let current = floor_hour(Utc::now())?;
+        for entry in walk_files(self.writer.directory())? {
+            if entry.extension().and_then(|v| v.to_str()) != Some("duckdb") {
+                continue;
+            }
+            let Some(hour) = hour_from_path(&entry) else {
+                continue;
+            };
+            if hour < current && !entry.with_extension("duckdb.uploaded").exists() {
+                self.upload_with_retry(ClosedDatabase { hour, path: entry })
+                    .await;
+            }
+        }
+        Ok(())
+    }
+
+    fn cleanup(&self) -> Result<()> {
+        let total = fs2::total_space(self.writer.directory())?;
+        let available = fs2::available_space(self.writer.directory())?;
+        let free = available
+            .saturating_mul(100)
+            .checked_div(total)
+            .unwrap_or(100);
+        let retention = if free < self.min_free_disk_percent {
+            self.min_retention_hours
+        } else {
+            self.max_retention_hours
+        };
+        let cutoff = floor_hour(Utc::now())? - chrono::Duration::hours(i64::try_from(retention)?);
+        for path in walk_files(self.writer.directory())? {
+            if path.extension().and_then(|v| v.to_str()) != Some("duckdb") {
+                continue;
+            }
+            let Some(hour) = hour_from_path(&path) else {
+                continue;
+            };
+            let marker = path.with_extension("duckdb.uploaded");
+            if hour < cutoff && marker.exists() {
+                std::fs::remove_file(&path)?;
+                std::fs::remove_file(marker)?;
+            }
+        }
+        Ok(())
+    }
 }
 
-struct ArchiveReport {
-    keys: Vec<String>,
-    bytes: u64,
+fn walk_files(root: &Path) -> Result<Vec<PathBuf>> {
+    let mut files = Vec::new();
+    if !root.exists() {
+        return Ok(files);
+    }
+    for day in std::fs::read_dir(root)? {
+        let day = day?.path();
+        if !day.is_dir() {
+            continue;
+        }
+        for file in std::fs::read_dir(day)? {
+            files.push(file?.path());
+        }
+    }
+    Ok(files)
+}
+
+fn hour_from_path(path: &Path) -> Option<DateTime<Utc>> {
+    let day = path.parent()?.file_name()?.to_str()?;
+    let hour = path.file_stem()?.to_str()?;
+    DateTime::parse_from_str(&format!("{day} {hour} +0000"), "%Y-%m-%d %H %z")
+        .ok()
+        .map(|v| v.with_timezone(&Utc))
 }

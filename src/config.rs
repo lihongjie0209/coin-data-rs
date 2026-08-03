@@ -47,14 +47,6 @@ impl Exchange {
             Self::Bybit => "bybit",
         }
     }
-
-    pub const fn default_archive_minute(self) -> u32 {
-        match self {
-            Self::Binance => 5,
-            Self::Okx => 20,
-            Self::Bybit => 35,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Parser)]
@@ -87,8 +79,6 @@ pub struct Config {
     rest_url: Option<String>,
     #[arg(long, default_value = "data/market.duckdb")]
     pub database: PathBuf,
-    #[arg(long, default_value = "data/parquet")]
-    pub parquet_dir: PathBuf,
     #[arg(long, default_value_t = 5_000)]
     pub batch_size: usize,
     #[arg(long, default_value_t = 20_000)]
@@ -99,7 +89,7 @@ pub struct Config {
     pub api_address: String,
     #[arg(long, default_value = "coin-data-196920285698-ap-southeast-1-an")]
     pub s3_bucket: String,
-    #[arg(long, default_value = "parquet-rust")]
+    #[arg(long, default_value = "duckdb/rust")]
     pub s3_prefix: String,
     #[arg(long, default_value = "ap-southeast-1")]
     pub aws_region: String,
@@ -109,8 +99,6 @@ pub struct Config {
     pub max_retention_hours: u64,
     #[arg(long, default_value_t = 20)]
     pub min_free_disk_percent: u64,
-    #[arg(long)]
-    archive_minute: Option<u32>,
 }
 
 impl Config {
@@ -126,18 +114,6 @@ impl Config {
                 let mut config = self.clone();
                 config.market = *market;
                 config.all_markets = false;
-                if self.all_markets {
-                    let parent = self
-                        .database
-                        .parent()
-                        .unwrap_or_else(|| std::path::Path::new("."));
-                    config.database = parent.join(format!(
-                        "{}-{}.duckdb",
-                        self.exchange.as_str(),
-                        market.as_str()
-                    ));
-                    config.archive_minute = None;
-                }
                 config
             })
             .collect()
@@ -159,9 +135,6 @@ impl Config {
         }
         if self.min_free_disk_percent > 100 {
             bail!("minimum free disk percent must be <= 100");
-        }
-        if self.archive_minute() > 59 {
-            bail!("archive minute must be <= 59");
         }
         Ok(())
     }
@@ -336,31 +309,6 @@ impl Config {
             },
             streams,
         }]
-    }
-
-    pub fn archive_minute(&self) -> u32 {
-        self.archive_minute
-            .unwrap_or_else(|| match (self.exchange, self.market) {
-                (Exchange::Binance, Market::Spot) => 5,
-                (Exchange::Binance, Market::Usdm) => 20,
-                (Exchange::Binance, Market::Coinm) => 35,
-                _ => self.exchange.default_archive_minute(),
-            })
-    }
-
-    pub fn dataset_parquet_dir(&self) -> PathBuf {
-        self.parquet_dir
-            .join(self.exchange.as_str())
-            .join(self.market.as_str())
-    }
-
-    pub fn dataset_s3_prefix(&self) -> String {
-        format!(
-            "{}/{}/{}",
-            self.s3_prefix.trim_matches('/'),
-            self.exchange.as_str(),
-            self.market.as_str()
-        )
     }
 
     fn instrument_url(&self) -> String {
