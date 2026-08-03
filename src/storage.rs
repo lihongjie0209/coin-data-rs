@@ -33,7 +33,9 @@ impl Storage {
             std::fs::create_dir_all(parent).context("create database directory")?;
         }
         let connection = Connection::open(path).context("open DuckDB")?;
-        connection.execute_batch("SET TimeZone='UTC';")?;
+        connection.execute_batch(
+            "SET TimeZone='UTC'; SET memory_limit='512MB'; SET threads=1; SET preserve_insertion_order=false;",
+        )?;
         connection
             .execute_batch(include_str!("schema.sql"))
             .context("initialize schema")?;
@@ -130,7 +132,9 @@ impl Storage {
                 let sql = format!(
                     "COPY (SELECT *, strftime({time_column}, '%Y-%m-%d') AS date, strftime({time_column}, '%H') AS hour FROM {table} WHERE {time_column} >= ? AND {time_column} < ? AND symbol IN ({symbol_list})) TO '{safe_path}' (FORMAT PARQUET, COMPRESSION ZSTD, PARTITION_BY (symbol, date, hour), WRITE_PARTITION_COLUMNS, OVERWRITE_OR_IGNORE, FILENAME_PATTERN 'data_{{i}}')"
                 );
-                self.connection.execute(&sql, params![start, end])?;
+                self.connection
+                    .execute(&sql, params![start, end])
+                    .with_context(|| format!("export {table} symbol batch"))?;
                 for symbol in symbols {
                     let partition_symbol =
                         url::form_urlencoded::byte_serialize(symbol.as_bytes()).collect::<String>();
@@ -200,22 +204,24 @@ impl Storage {
     }
 
     pub fn record_uploads(&mut self, uploads: &[UploadRecord]) -> Result<()> {
-        let transaction = self.connection.transaction()?;
-        for upload in uploads {
-            transaction.execute(
-                "INSERT OR REPLACE INTO parquet_symbol_uploads VALUES (?, ?, ?, ?, ?, ?, ?, now())",
-                params![
-                    &upload.table,
-                    &upload.symbol,
-                    upload.start,
-                    &upload.bucket,
-                    &upload.key,
-                    &upload.etag,
-                    upload.size
-                ],
-            )?;
+        for uploads in uploads.chunks(500) {
+            let transaction = self.connection.transaction()?;
+            for upload in uploads {
+                transaction.execute(
+                    "INSERT OR REPLACE INTO parquet_symbol_uploads VALUES (?, ?, ?, ?, ?, ?, ?, now())",
+                    params![
+                        &upload.table,
+                        &upload.symbol,
+                        upload.start,
+                        &upload.bucket,
+                        &upload.key,
+                        &upload.etag,
+                        upload.size
+                    ],
+                )?;
+            }
+            transaction.commit()?;
         }
-        transaction.commit()?;
         Ok(())
     }
 

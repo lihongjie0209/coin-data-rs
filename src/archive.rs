@@ -101,8 +101,11 @@ impl Archiver {
             .map(|upload| upload.key.clone())
             .collect::<Vec<_>>();
         let bytes = uploads.iter().map(|upload| upload.size).sum();
-        self.writer.record_uploads(uploads).await?;
-        self.cleanup().await?;
+        self.writer
+            .record_uploads(uploads)
+            .await
+            .context("record Parquet uploads")?;
+        self.cleanup().await.context("post-upload cleanup")?;
         Ok(ArchiveReport { keys, bytes })
     }
 
