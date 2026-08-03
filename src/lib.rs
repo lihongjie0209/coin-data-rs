@@ -4,6 +4,7 @@ pub mod backfill;
 pub mod collector;
 pub mod config;
 pub mod model;
+pub mod notify;
 pub mod parser;
 pub mod runtime;
 pub mod storage;

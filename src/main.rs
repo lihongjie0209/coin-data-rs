@@ -8,6 +8,7 @@ use coin_data_rs::{
     backfill::Backfiller,
     collector,
     config::Config,
+    notify::TelegramNotifier,
     runtime::Metrics,
     writer::Writer,
 };
@@ -40,7 +41,8 @@ async fn main() -> Result<()> {
     );
     let backfiller = Backfiller::new(config.rest_url.clone(), symbols.clone(), writer.clone());
     backfiller.clone().spawn();
-    let archiver = Arc::new(Archiver::new(&config, writer.clone(), backfiller).await);
+    let notifier = TelegramNotifier::from_env(Arc::clone(&metrics));
+    let archiver = Arc::new(Archiver::new(&config, writer.clone(), backfiller, notifier).await);
     Arc::clone(&archiver).spawn_hourly();
 
     for (id, streams) in config.shards(&symbols).into_iter().enumerate() {

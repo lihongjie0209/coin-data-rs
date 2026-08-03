@@ -14,12 +14,12 @@ pub struct Metrics {
 
 #[derive(Debug, Serialize)]
 pub struct MetricsSnapshot {
-    received_messages: u64,
-    parsed_records: u64,
-    written_records: u64,
-    parse_errors: u64,
-    reconnects: u64,
-    dropped_messages: u64,
+    pub received_messages: u64,
+    pub parsed_records: u64,
+    pub written_records: u64,
+    pub parse_errors: u64,
+    pub reconnects: u64,
+    pub dropped_messages: u64,
 }
 
 impl Metrics {

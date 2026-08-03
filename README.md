@@ -43,6 +43,10 @@ parquet/rust/BTCUSDT/aggregate_trades/2026-08-03/04/data.parquet
 Only table/symbol/hour partitions containing rows produce files. Every source field, including
 `symbol`, remains present in each Parquet file.
 
+Set `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` to receive a success or failure report after every
+automatic or manually triggered archive. Reports include file count, bytes, duration, collector
+counters, load average, memory, and disk usage.
+
 ## Tables
 
 `depth_updates`, `depth_levels`, `aggregate_trades`, `trades`, `book_tickers`, `tickers`, `rolling_tickers`, `mini_tickers`, `klines`, and `average_prices`. Raw JSON is not retained.

@@ -1,4 +1,4 @@
-use std::{path::PathBuf, sync::Arc};
+use std::{path::PathBuf, sync::Arc, time::Instant};
 
 use anyhow::{Context, Result};
 use aws_config::{BehaviorVersion, Region};
@@ -6,7 +6,13 @@ use aws_sdk_s3::{Client, primitives::ByteStream};
 use chrono::{DateTime, Timelike, Utc};
 use futures_util::{StreamExt, TryStreamExt, stream};
 
-use crate::{backfill::Backfiller, config::Config, storage::UploadRecord, writer::Writer};
+use crate::{
+    backfill::Backfiller,
+    config::Config,
+    notify::{ArchiveNotification, TelegramNotifier},
+    storage::UploadRecord,
+    writer::Writer,
+};
 
 #[derive(Clone)]
 pub struct Archiver {
@@ -19,10 +25,16 @@ pub struct Archiver {
     min_retention_hours: u64,
     max_retention_hours: u64,
     min_free_disk_percent: u64,
+    notifier: TelegramNotifier,
 }
 
 impl Archiver {
-    pub async fn new(config: &Config, writer: Writer, backfiller: Backfiller) -> Self {
+    pub async fn new(
+        config: &Config,
+        writer: Writer,
+        backfiller: Backfiller,
+        notifier: TelegramNotifier,
+    ) -> Self {
         let sdk = aws_config::defaults(BehaviorVersion::latest())
             .region(Region::new(config.aws_region.clone()))
             .load()
@@ -37,10 +49,36 @@ impl Archiver {
             min_retention_hours: config.min_retention_hours,
             max_retention_hours: config.max_retention_hours,
             min_free_disk_percent: config.min_free_disk_percent,
+            notifier,
         }
     }
 
     pub async fn export(&self, start: DateTime<Utc>, force: bool) -> Result<Vec<String>> {
+        let started = Instant::now();
+        let result = self.export_inner(start, force).await;
+        let (status, files, bytes, error) = match &result {
+            Ok(report) => ("SUCCESS", report.keys.len(), report.bytes, None),
+            Err(error) => ("FAILED", 0, 0, Some(error)),
+        };
+        if let Err(error) = self
+            .notifier
+            .send_archive_report(ArchiveNotification {
+                status,
+                hour: start.format("%Y-%m-%d %H:00 UTC").to_string(),
+                files,
+                bytes,
+                elapsed_seconds: started.elapsed().as_secs_f64(),
+                error,
+                data_directory: &self.directory,
+            })
+            .await
+        {
+            tracing::warn!(%error, "Telegram archive notification failed");
+        }
+        result.map(|report| report.keys)
+    }
+
+    async fn export_inner(&self, start: DateTime<Utc>, force: bool) -> Result<ArchiveReport> {
         std::fs::create_dir_all(&self.directory).context("create parquet directory")?;
         self.cleanup().await?;
         self.backfiller.run().await.context("pre-export backfill")?;
@@ -62,9 +100,10 @@ impl Archiver {
             .iter()
             .map(|upload| upload.key.clone())
             .collect::<Vec<_>>();
+        let bytes = uploads.iter().map(|upload| upload.size).sum();
         self.writer.record_uploads(uploads).await?;
         self.cleanup().await?;
-        Ok(keys)
+        Ok(ArchiveReport { keys, bytes })
     }
 
     async fn upload_file(
@@ -151,4 +190,9 @@ impl Archiver {
             }
         });
     }
+}
+
+struct ArchiveReport {
+    keys: Vec<String>,
+    bytes: u64,
 }
