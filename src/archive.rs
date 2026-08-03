@@ -71,6 +71,7 @@ impl Archiver {
                 status,
                 hour: start.format("%Y-%m-%d %H:00 UTC").to_string(),
                 files,
+                source_files: files,
                 bytes,
                 elapsed_seconds: started.elapsed().as_secs_f64(),
                 error,

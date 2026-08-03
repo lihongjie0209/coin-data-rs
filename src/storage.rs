@@ -28,6 +28,30 @@ pub struct UploadRecord {
 }
 
 impl Storage {
+    pub fn query_parquet(directory: &Path, sql: &str) -> Result<serde_json::Value> {
+        let storage = Self {
+            connection: Connection::open_in_memory().context("open in-memory DuckDB")?,
+        };
+        storage
+            .connection
+            .execute_batch("SET TimeZone='UTC'; SET memory_limit='256MB'; SET threads=1;")?;
+        for table in TABLES {
+            if has_parquet_table(directory, table) {
+                let path = directory
+                    .join("*")
+                    .join(table)
+                    .join("*")
+                    .join("*")
+                    .join("*.parquet")
+                    .to_string_lossy()
+                    .replace('\'', "''");
+                storage.connection.execute_batch(&format!(
+                    "CREATE VIEW {table} AS SELECT * FROM read_parquet('{path}', union_by_name=true)"
+                ))?;
+            }
+        }
+        storage.query_json(sql)
+    }
     pub fn open(path: &Path) -> Result<Self> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).context("create database directory")?;
@@ -252,6 +276,15 @@ impl Storage {
         transaction.commit()?;
         Ok(deleted)
     }
+}
+
+fn has_parquet_table(directory: &Path, table: &str) -> bool {
+    let Ok(symbols) = std::fs::read_dir(directory) else {
+        return false;
+    };
+    symbols
+        .flatten()
+        .any(|symbol| symbol.path().join(table).is_dir())
 }
 
 fn time_column(table: &str) -> &'static str {

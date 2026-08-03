@@ -11,7 +11,7 @@ use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::{archive::Archiver, runtime::Metrics, writer::Writer};
+use crate::{runtime::Metrics, stream_writer::StreamWriter, uploader::Uploader};
 
 #[derive(Clone)]
 pub struct ApiState {
@@ -20,9 +20,10 @@ pub struct ApiState {
 
 #[derive(Clone)]
 pub struct DatasetState {
-    pub writer: Writer,
+    pub writer: StreamWriter,
     pub metrics: Arc<Metrics>,
-    pub archiver: Arc<Archiver>,
+    pub uploader: Uploader,
+    pub directory: std::path::PathBuf,
 }
 
 pub fn router(state: ApiState) -> Router {
@@ -45,7 +46,7 @@ async fn stats(State(state): State<ApiState>) -> Result<Json<Value>, ApiError> {
             name.clone(),
             json!({
                 "runtime": dataset.metrics.snapshot(),
-                "database": dataset.writer.stats().await?,
+                "parquet": dataset.writer.stats(),
             }),
         );
     }
@@ -71,7 +72,13 @@ async fn sql(
         .datasets
         .get(&request.market)
         .ok_or_else(|| anyhow::anyhow!("unknown market {}", request.market))?;
-    Ok(Json(dataset.writer.query(request.sql).await?))
+    let directory = dataset.directory.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        crate::storage::Storage::query_parquet(&directory, &request.sql)
+    })
+    .await
+    .map_err(anyhow::Error::from)??;
+    Ok(Json(result))
 }
 
 #[derive(Deserialize)]
@@ -91,8 +98,13 @@ async fn archive(
         .datasets
         .get(&request.market)
         .ok_or_else(|| anyhow::anyhow!("unknown market {}", request.market))?;
-    let keys = dataset.archiver.export(request.hour, request.force).await?;
-    Ok(Json(json!({"uploaded": keys})))
+    let uploaded = dataset
+        .uploader
+        .scan_window(Some(request.hour), request.force)
+        .await?;
+    Ok(Json(
+        json!({"upload": uploaded, "hour": request.hour, "force": request.force}),
+    ))
 }
 
 struct ApiError(anyhow::Error);

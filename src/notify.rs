@@ -18,6 +18,7 @@ pub struct ArchiveNotification<'a> {
     pub status: &'a str,
     pub hour: String,
     pub files: usize,
+    pub source_files: usize,
     pub bytes: u64,
     pub elapsed_seconds: f64,
     pub error: Option<&'a anyhow::Error>,
@@ -52,11 +53,12 @@ impl TelegramNotifier {
         let disk_total = fs2::total_space(report.data_directory).unwrap_or_default();
         let disk_available = fs2::available_space(report.data_directory).unwrap_or_default();
         let mut text = format!(
-            "Parquet {}\ndataset: {}\nhour: {}\nfiles: {}\ndata: {}\nelapsed: {:.1}s\nrecords: received={} parsed={} written={} dropped={} errors={} reconnects={}\nwriter queue: current={} peak={}\nlast message: {}\nload1: {load}\nmemory: {} / {}\ndisk: {} free / {}",
+            "Parquet upload {}\ndataset: {}\nwindow: {}\nmerged files: {}\nsource parts: {}\ndata: {}\nelapsed: {:.1}s\nrecords: received={} parsed={} written={} dropped={} errors={} reconnects={}\nwriter queue: current={} peak={}\nlast message: {}\nload1: {load}\nmemory: {} / {}\ndisk: {} free / {}",
             report.status,
             self.dataset,
             report.hour,
             report.files,
+            report.source_files,
             human_bytes(report.bytes),
             report.elapsed_seconds,
             runtime.received_messages,
