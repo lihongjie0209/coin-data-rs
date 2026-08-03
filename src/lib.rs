@@ -8,6 +8,7 @@ pub mod futures_poll;
 pub mod model;
 pub mod notify;
 pub mod parser;
+pub mod rate_limit;
 pub mod runtime;
 pub mod storage;
 pub mod writer;

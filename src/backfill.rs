@@ -5,7 +5,7 @@ use chrono::{DateTime, Utc};
 use serde_json::Value;
 use tokio::sync::Mutex;
 
-use crate::{config::Market, futures_parser, parser, writer::Writer};
+use crate::{config::Market, futures_parser, parser, rate_limit, writer::Writer};
 
 const MAX_GAPS_PER_AUDIT: usize = 100;
 
@@ -142,6 +142,11 @@ impl Backfiller {
         let mut delay = Duration::from_millis(250);
         let mut last_error = None;
         for _ in 0..3 {
+            let blocked = rate_limit::remaining_seconds();
+            if blocked > 0 {
+                tokio::time::sleep(Duration::from_secs(blocked.min(60))).await;
+                continue;
+            }
             let query = [
                 ("symbol", symbol.to_owned()),
                 ("fromId", from_id.to_string()),
@@ -149,6 +154,7 @@ impl Backfiller {
             ];
             match self.client.get(&url).query(&query).send().await {
                 Ok(response) => {
+                    rate_limit::observe_response(&response);
                     let retry_after = response
                         .headers()
                         .get(reqwest::header::RETRY_AFTER)

@@ -4,7 +4,7 @@ use anyhow::Result;
 use chrono::Utc;
 use futures_util::{StreamExt, stream};
 
-use crate::{config::Market, futures_parser, writer::Writer};
+use crate::{config::Market, futures_parser, rate_limit, writer::Writer};
 
 #[derive(Clone)]
 pub struct OpenInterestPoller {
@@ -39,6 +39,14 @@ impl OpenInterestPoller {
     }
 
     async fn run(&self) -> Result<()> {
+        let blocked = rate_limit::remaining_seconds();
+        if blocked > 0 {
+            tracing::warn!(
+                blocked_seconds = blocked,
+                "open interest poll skipped by Binance REST backoff"
+            );
+            return Ok(());
+        }
         let endpoint = match self.market {
             Market::Usdm => "/fapi/v1/openInterest",
             Market::Coinm => "/dapi/v1/openInterest",
@@ -53,18 +61,16 @@ impl OpenInterestPoller {
             let client = self.client.clone();
             let url = format!("{}{endpoint}", self.rest_url.trim_end_matches('/'));
             async move {
-                let value = client
-                    .get(url)
-                    .query(&[("symbol", &symbol)])
-                    .send()
-                    .await?
+                let response = client.get(url).query(&[("symbol", &symbol)]).send().await?;
+                rate_limit::observe_response(&response);
+                let value = response
                     .error_for_status()?
                     .json::<serde_json::Value>()
                     .await?;
                 anyhow::Ok((symbol, value))
             }
         }))
-        .buffer_unordered(16);
+        .buffer_unordered(8);
         tokio::pin!(requests);
         let received = Utc::now();
         let mut records = Vec::with_capacity(self.symbols.len());
@@ -73,7 +79,12 @@ impl OpenInterestPoller {
                 Ok((symbol, value)) => records.push(futures_parser::parse_open_interest(
                     &symbol, &value, received, source,
                 )),
-                Err(error) => tracing::warn!(%error, "fetch open interest for symbol failed"),
+                Err(error) => {
+                    tracing::warn!(%error, "fetch open interest for symbol failed");
+                    if rate_limit::remaining_seconds() > 0 {
+                        break;
+                    }
+                }
             }
         }
         let count = records.len();
