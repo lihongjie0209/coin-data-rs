@@ -5,7 +5,6 @@ use clap::Parser;
 use coin_data_rs::{
     api::{ApiState, DatasetState, router},
     archive::Archiver,
-    backfill::Backfiller,
     collector,
     config::Config,
     futures_poll::OpenInterestPoller,
@@ -62,13 +61,6 @@ async fn start_dataset(config: Config) -> Result<DatasetState> {
         config.flush_interval(),
         Arc::clone(&metrics),
     )?;
-    let backfiller = if config.exchange == coin_data_rs::config::Exchange::Binance {
-        let backfiller = Backfiller::new(config.rest_url(), writer.clone(), config.market);
-        backfiller.clone().spawn();
-        Some(backfiller)
-    } else {
-        None
-    };
     let notifier = TelegramNotifier::from_env(
         Arc::clone(&metrics),
         format!("{}/{}", config.exchange.as_str(), config.market.as_str()),
@@ -84,7 +76,7 @@ async fn start_dataset(config: Config) -> Result<DatasetState> {
         )
         .spawn();
     }
-    let archiver = Arc::new(Archiver::new(&config, writer.clone(), backfiller, notifier).await);
+    let archiver = Arc::new(Archiver::new(&config, writer.clone(), notifier).await);
     Arc::clone(&archiver).spawn_hourly();
 
     let mut shard_id = 0;

@@ -19,10 +19,9 @@ cargo run --release -- \
 
 Use `--help` for all settings. By default the process runs `spot`, `usdm`, and `coinm` together and creates `binance-spot.duckdb`, `binance-usdm.duckdb`, and `binance-coinm.duckdb` next to the `--database` path. Set `--all-markets=false --market usdm` to run one market only. The default `--symbols ALL` discovers all currently tradable instruments in each market. The desired connection count defaults to four per market and is automatically increased when Binance's 1024-stream limit requires it. USDⓈ-M high-frequency public streams and regular market streams are routed to their separate endpoints.
 
-Aggregate-trade gaps are checked over a bounded time range every ten minutes and over the exact hour
-immediately before export. Audits are serialized so the periodic and pre-export checks cannot run
-twice concurrently. Spot uses `/api/v3/aggTrades`; futures use their corresponding `/fapi` or `/dapi`
-endpoint. Futures open interest is sampled once per minute.
+Aggregate trades come only from real-time WebSocket streams; REST historical backfill is disabled.
+Futures open interest is sampled once per minute and shares a global Binance REST backoff after
+HTTP 418 or 429 responses.
 
 Local structured data is normally retained for at most eight hours. When free disk falls below 20%, uploaded rows older than four hours are reclaimed; data inside the four-hour safety window is never pressure-deleted. All three thresholds are configurable.
 

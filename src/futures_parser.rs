@@ -25,32 +25,6 @@ pub fn parse(payload: &[u8], received: DateTime<Utc>, source: &str) -> Result<Ve
     }
 }
 
-pub fn parse_rest_aggregate_trade(
-    symbol: &str,
-    data: &Value,
-    received: DateTime<Utc>,
-    source: &str,
-) -> Record {
-    let trade_time = millis(data, "T", received);
-    Record {
-        table: "futures_aggregate_trades",
-        values: vec![
-            trade_time.clone(),
-            timestamp(received),
-            text(symbol),
-            text(string(data, "ps")),
-            uint(data, "a"),
-            decimal(data, "p"),
-            decimal(data, "q"),
-            uint(data, "f"),
-            uint(data, "l"),
-            trade_time,
-            boolean(data, "m"),
-            text(source),
-        ],
-    }
-}
-
 pub fn parse_open_interest(
     symbol: &str,
     data: &Value,

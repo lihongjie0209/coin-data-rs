@@ -37,13 +37,6 @@ pub enum Command {
         bucket: String,
         response: oneshot::Sender<Result<usize>>,
     },
-    AggregateTradeGaps {
-        table: &'static str,
-        start: DateTime<Utc>,
-        end: DateTime<Utc>,
-        limit: usize,
-        response: oneshot::Sender<Result<Vec<crate::storage::AggregateTradeGap>>>,
-    },
 }
 
 struct SnapshotResumeGuard(Arc<(Mutex<bool>, Condvar)>);
@@ -195,28 +188,6 @@ impl Writer {
             .context("database maintenance dropped response")?
     }
 
-    pub async fn aggregate_trade_gaps(
-        &self,
-        table: &'static str,
-        start: DateTime<Utc>,
-        end: DateTime<Utc>,
-        limit: usize,
-    ) -> Result<Vec<crate::storage::AggregateTradeGap>> {
-        let (response, result) = oneshot::channel();
-        self.sender
-            .send(Command::AggregateTradeGaps {
-                table,
-                start,
-                end,
-                limit,
-                response,
-            })
-            .await?;
-        result
-            .await
-            .context("database writer dropped gap response")?
-    }
-
     fn observe_queue(&self) {
         let used = self
             .sender
@@ -307,15 +278,6 @@ fn handle(storage: &mut Storage, command: Command) -> Result<bool> {
             response,
         } => {
             let _ = response.send(storage.cleanup(cutoff, &bucket));
-        }
-        Command::AggregateTradeGaps {
-            table,
-            start,
-            end,
-            limit,
-            response,
-        } => {
-            let _ = response.send(storage.aggregate_trade_gaps(table, start, end, limit));
         }
     }
     Ok(false)

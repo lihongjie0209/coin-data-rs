@@ -7,7 +7,6 @@ use chrono::{DateTime, Timelike, Utc};
 use futures_util::{StreamExt, TryStreamExt, stream};
 
 use crate::{
-    backfill::Backfiller,
     config::Config,
     notify::{ArchiveNotification, TelegramNotifier},
     storage::UploadRecord,
@@ -21,7 +20,6 @@ pub struct Archiver {
     bucket: String,
     prefix: String,
     directory: PathBuf,
-    backfiller: Option<Backfiller>,
     min_retention_hours: u64,
     max_retention_hours: u64,
     min_free_disk_percent: u64,
@@ -31,12 +29,7 @@ pub struct Archiver {
 }
 
 impl Archiver {
-    pub async fn new(
-        config: &Config,
-        writer: Writer,
-        backfiller: Option<Backfiller>,
-        notifier: TelegramNotifier,
-    ) -> Self {
+    pub async fn new(config: &Config, writer: Writer, notifier: TelegramNotifier) -> Self {
         let sdk = aws_config::defaults(BehaviorVersion::latest())
             .region(Region::new(config.aws_region.clone()))
             .load()
@@ -47,7 +40,6 @@ impl Archiver {
             bucket: config.s3_bucket.clone(),
             prefix: config.dataset_s3_prefix(),
             directory: config.dataset_parquet_dir(),
-            backfiller,
             min_retention_hours: config.min_retention_hours,
             max_retention_hours: config.max_retention_hours,
             min_free_disk_percent: config.min_free_disk_percent,
@@ -92,12 +84,6 @@ impl Archiver {
             .and_then(|value| value.with_nanosecond(0))
             .context("invalid archive hour")?;
         let end = start + chrono::Duration::hours(1);
-        if let Some(backfiller) = &self.backfiller {
-            backfiller
-                .run_range(start, end)
-                .await
-                .context("pre-export backfill")?;
-        }
         let files = self
             .writer
             .export(start, end, self.directory.clone(), force)

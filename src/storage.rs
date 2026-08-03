@@ -30,13 +30,6 @@ pub struct UploadRecord {
     pub size: u64,
 }
 
-#[derive(Debug, PartialEq, Eq)]
-pub struct AggregateTradeGap {
-    pub symbol: String,
-    pub first_id: u64,
-    pub last_id: u64,
-}
-
 impl Storage {
     pub fn open(path: &Path) -> Result<Self> {
         if let Some(parent) = path.parent() {
@@ -82,31 +75,6 @@ impl Storage {
             appender.flush().with_context(|| format!("flush {table}"))?;
         }
         Ok(records.len())
-    }
-
-    pub fn aggregate_trade_gaps(
-        &self,
-        table: &str,
-        start: DateTime<Utc>,
-        end: DateTime<Utc>,
-        limit: usize,
-    ) -> Result<Vec<AggregateTradeGap>> {
-        if !matches!(table, "aggregate_trades" | "futures_aggregate_trades") {
-            anyhow::bail!("unsupported aggregate trade table {table}");
-        }
-        let sql = format!(
-            "WITH ids AS (SELECT DISTINCT symbol, aggregate_trade_id id FROM {table} WHERE event_time >= ? AND event_time < ?), gaps AS (SELECT symbol, lag(id) OVER (PARTITION BY symbol ORDER BY id) previous_id, id FROM ids) SELECT symbol, previous_id + 1, id - 1 FROM gaps WHERE id > previous_id + 1 ORDER BY symbol, id LIMIT ?"
-        );
-        let mut statement = self.connection.prepare(&sql)?;
-        let rows = statement.query_map(params![start, end, i64::try_from(limit)?], |row| {
-            Ok(AggregateTradeGap {
-                symbol: row.get(0)?,
-                first_id: row.get(1)?,
-                last_id: row.get(2)?,
-            })
-        })?;
-        rows.collect::<duckdb::Result<Vec<_>>>()
-            .context("collect aggregate trade gaps")
     }
 
     pub fn stats(&self) -> Result<serde_json::Value> {
@@ -414,42 +382,6 @@ mod tests {
             storage.export_hour(start, start + chrono::Duration::hours(1), &parquet, false)?;
 
         assert!(files.is_empty());
-        Ok(())
-    }
-
-    #[test]
-    fn aggregate_trade_gaps_should_find_missing_id_per_symbol() -> Result<()> {
-        let temporary = tempdir()?;
-        let database = temporary.path().join("market.duckdb");
-        let start = Utc
-            .with_ymd_and_hms(2026, 8, 3, 4, 0, 0)
-            .single()
-            .context("invalid test time")?;
-        let mut storage = Storage::open(&database)?;
-        let mut records = Vec::new();
-        for id in [1, 3] {
-            let payload = format!(
-                r#"{{"stream":"btcusdt@aggTrade","data":{{"e":"aggTrade","E":1785731400000,"s":"BTCUSDT","a":{id},"p":"1","q":"2","f":{id},"l":{id},"T":1785731400000,"m":false,"M":true}}}}"#
-            );
-            records.extend(parser::parse(payload.as_bytes(), start, "websocket")?);
-        }
-        storage.insert(&records)?;
-
-        let gaps = storage.aggregate_trade_gaps(
-            "aggregate_trades",
-            start - chrono::Duration::hours(1),
-            start + chrono::Duration::hours(1),
-            100,
-        )?;
-
-        assert_eq!(
-            gaps,
-            vec![AggregateTradeGap {
-                symbol: "BTCUSDT".to_owned(),
-                first_id: 2,
-                last_id: 2,
-            }]
-        );
         Ok(())
     }
 

@@ -96,26 +96,6 @@ pub fn parse(payload: &[u8], received: DateTime<Utc>, source: &str) -> Result<Ve
     }
 }
 
-pub fn parse_rest_aggregate_trade(symbol: &str, data: &Value, received: DateTime<Utc>) -> Record {
-    record(
-        "aggregate_trades",
-        vec![
-            millis(data, "T", received),
-            timestamp(received),
-            text(symbol),
-            uint(data, "a"),
-            decimal(data, "p"),
-            decimal(data, "q"),
-            uint(data, "f"),
-            uint(data, "l"),
-            millis(data, "T", received),
-            boolean(data, "m"),
-            optional_boolean(data, "M", true),
-            text("rest_backfill"),
-        ],
-    )
-}
-
 fn parse_depth(data: &Value, received: DateTime<Utc>, source: &str) -> Result<Vec<Record>> {
     let event_at = event_time(data, received);
     let symbol = string(data, "s");
