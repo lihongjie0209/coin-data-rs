@@ -107,7 +107,7 @@ impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": self.0.to_string()})),
+            Json(json!({"error": format!("{:#}", self.0)})),
         )
             .into_response()
     }

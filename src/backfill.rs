@@ -7,7 +7,7 @@ use tokio::sync::Mutex;
 
 use crate::{config::Market, futures_parser, parser, writer::Writer};
 
-const MAX_GAPS_PER_AUDIT: usize = 10_000;
+const MAX_GAPS_PER_AUDIT: usize = 100;
 
 #[derive(Clone)]
 pub struct Backfiller {
@@ -57,6 +57,7 @@ impl Backfiller {
             .aggregate_trade_gaps(table, start, end, MAX_GAPS_PER_AUDIT)
             .await
             .context("query aggregate trade gaps")?;
+        let has_more = gaps.len() == MAX_GAPS_PER_AUDIT;
         let mut inserted = 0;
         for gap in gaps {
             inserted += self
@@ -74,6 +75,12 @@ impl Backfiller {
                 inserted,
                 market = self.market.as_str(),
                 "aggregate trade gaps backfilled"
+            );
+        }
+        if has_more {
+            anyhow::bail!(
+                "aggregate trade audit reached the {} gap limit; remaining gaps will be retried",
+                MAX_GAPS_PER_AUDIT
             );
         }
         Ok(inserted)
@@ -141,18 +148,40 @@ impl Backfiller {
                 ("limit", limit.to_string()),
             ];
             match self.client.get(&url).query(&query).send().await {
-                Ok(response) => match response.error_for_status() {
-                    Ok(response) => {
-                        return response.json().await.context("decode aggregate trades");
+                Ok(response) => {
+                    let retry_after = response
+                        .headers()
+                        .get(reqwest::header::RETRY_AFTER)
+                        .and_then(|value| value.to_str().ok())
+                        .and_then(|value| value.parse::<u64>().ok());
+                    match response.error_for_status() {
+                        Ok(response) => {
+                            let values =
+                                response.json().await.context("decode aggregate trades")?;
+                            tokio::time::sleep(self.request_spacing()).await;
+                            return Ok(values);
+                        }
+                        Err(error) => {
+                            last_error = Some(error.into());
+                            if let Some(seconds) = retry_after {
+                                delay = Duration::from_secs(seconds.clamp(1, 60));
+                            }
+                        }
                     }
-                    Err(error) => last_error = Some(error.into()),
-                },
+                }
                 Err(error) => last_error = Some(error.into()),
             }
             tokio::time::sleep(delay).await;
             delay *= 2;
         }
         Err(last_error.unwrap_or_else(|| anyhow::anyhow!("aggregate trade request failed")))
+    }
+
+    fn request_spacing(&self) -> Duration {
+        match self.market {
+            Market::Spot => Duration::from_millis(100),
+            Market::Usdm | Market::Coinm => Duration::from_secs(1),
+        }
     }
 }
 

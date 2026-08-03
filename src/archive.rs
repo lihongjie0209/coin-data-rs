@@ -207,8 +207,30 @@ impl Archiver {
                     .and_then(|value| value.with_second(0))
                     .and_then(|value| value.with_nanosecond(0));
                 let Some(hour) = hour else { continue };
-                if let Err(error) = self.export(hour, false).await {
-                    tracing::error!(error = %format!("{error:#}"), %hour, "hourly archive failed");
+                let mut attempt = 1;
+                loop {
+                    match self.export(hour, false).await {
+                        Ok(_) => break,
+                        Err(error) if attempt < 4 => {
+                            tracing::warn!(
+                                error = %format!("{error:#}"),
+                                %hour,
+                                attempt,
+                                "hourly archive will retry"
+                            );
+                            attempt += 1;
+                            tokio::time::sleep(std::time::Duration::from_secs(120)).await;
+                        }
+                        Err(error) => {
+                            tracing::error!(
+                                error = %format!("{error:#}"),
+                                %hour,
+                                attempt,
+                                "hourly archive retries exhausted"
+                            );
+                            break;
+                        }
+                    }
                 }
             }
         });
