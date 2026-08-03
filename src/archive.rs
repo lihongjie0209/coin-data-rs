@@ -23,7 +23,7 @@ use crate::{
 };
 
 const S3_REQUEST_TIMEOUT: Duration = Duration::from_secs(90);
-const S3_UPLOAD_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+const S3_UPLOAD_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const UPLOAD_RETRY_DELAY: Duration = Duration::from_secs(30);
 
 #[derive(Clone)]
@@ -255,7 +255,7 @@ impl Archiver {
         };
         let result = tokio::time::timeout(S3_UPLOAD_TIMEOUT, result)
             .await
-            .context("multipart upload exceeded 5 minutes")
+            .context("multipart upload exceeded 30 minutes")
             .and_then(|result| result);
         if result.is_err()
             && let Err(error) = await_s3(
