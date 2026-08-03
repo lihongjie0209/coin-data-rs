@@ -227,7 +227,7 @@ impl Config {
         if (self.exchange, self.market, group.name) == (Exchange::Binance, Market::Usdm, "public") {
             // Binance's USD-M high-frequency depth/book-ticker endpoint becomes unstable long
             // before the documented 1,024-stream ceiling on a small collector host.
-            384
+            128
         } else {
             1_024
         }
@@ -399,7 +399,7 @@ mod tests {
             .iter()
             .position(|group| group.name == "public")
             .unwrap_or_default();
-        assert_eq!(counts[public], 4);
-        assert!(728 * groups[public].streams.len() / counts[public] <= 384);
+        assert_eq!(counts[public], 12);
+        assert!(728 * groups[public].streams.len() / counts[public] <= 128);
     }
 }
