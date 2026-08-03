@@ -20,8 +20,8 @@ const WRITER_SHARDS: usize = 4;
 const MAX_BUFFER_BYTES: usize = 16 * 1024 * 1024;
 const TARGET_BUFFER_BYTES: usize = 12 * 1024 * 1024;
 const PARTITION_BYTES: usize = 4 * 1024 * 1024;
-const PARTITION_ROWS: usize = 16_384;
-const MAX_BUFFER_AGE: Duration = Duration::from_secs(5 * 60);
+const PARTITION_ROWS: usize = 4_096;
+const MAX_BUFFER_AGE: Duration = Duration::from_secs(30);
 
 #[derive(Clone)]
 pub struct StreamWriter {
