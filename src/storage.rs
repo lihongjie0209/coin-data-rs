@@ -121,44 +121,46 @@ impl Storage {
             }
             std::fs::create_dir_all(&staging_directory)?;
             let safe_path = staging_directory.to_string_lossy().replace('\'', "''");
-            let symbol_list = symbols
-                .iter()
-                .map(|symbol| format!("'{}'", symbol.replace('\'', "''")))
-                .collect::<Vec<_>>()
-                .join(",");
-            let sql = format!(
-                "COPY (SELECT *, strftime({time_column}, '%Y-%m-%d') AS date, strftime({time_column}, '%H') AS hour FROM {table} WHERE {time_column} >= ? AND {time_column} < ? AND symbol IN ({symbol_list}) ORDER BY symbol, {time_column}) TO '{safe_path}' (FORMAT PARQUET, COMPRESSION ZSTD, PARTITION_BY (symbol, date, hour), WRITE_PARTITION_COLUMNS, OVERWRITE_OR_IGNORE, FILENAME_PATTERN 'data_{{i}}')"
-            );
-            self.connection.execute(&sql, params![start, end])?;
-            for symbol in symbols {
-                let partition_symbol =
-                    url::form_urlencoded::byte_serialize(symbol.as_bytes()).collect::<String>();
-                let staged_path = staging_directory
-                    .join(format!("symbol={partition_symbol}"))
-                    .join(format!("date={}", start.format("%Y-%m-%d")))
-                    .join(format!("hour={}", start.format("%H")))
-                    .join("data_0.parquet");
-                if !staged_path.is_file() {
-                    anyhow::bail!("DuckDB did not create {}", staged_path.display());
+            for symbols in symbols.chunks(100) {
+                let symbol_list = symbols
+                    .iter()
+                    .map(|symbol| format!("'{}'", symbol.replace('\'', "''")))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let sql = format!(
+                    "COPY (SELECT *, strftime({time_column}, '%Y-%m-%d') AS date, strftime({time_column}, '%H') AS hour FROM {table} WHERE {time_column} >= ? AND {time_column} < ? AND symbol IN ({symbol_list})) TO '{safe_path}' (FORMAT PARQUET, COMPRESSION ZSTD, PARTITION_BY (symbol, date, hour), WRITE_PARTITION_COLUMNS, OVERWRITE_OR_IGNORE, FILENAME_PATTERN 'data_{{i}}')"
+                );
+                self.connection.execute(&sql, params![start, end])?;
+                for symbol in symbols {
+                    let partition_symbol =
+                        url::form_urlencoded::byte_serialize(symbol.as_bytes()).collect::<String>();
+                    let staged_path = staging_directory
+                        .join(format!("symbol={partition_symbol}"))
+                        .join(format!("date={}", start.format("%Y-%m-%d")))
+                        .join(format!("hour={}", start.format("%H")))
+                        .join("data_0.parquet");
+                    if !staged_path.is_file() {
+                        anyhow::bail!("DuckDB did not create {}", staged_path.display());
+                    }
+                    let path = directory
+                        .join(symbol)
+                        .join(*table)
+                        .join(start.format("%Y-%m-%d").to_string())
+                        .join(start.format("%H").to_string())
+                        .join("data.parquet");
+                    let parent = path.parent().context("Parquet path has no parent")?;
+                    std::fs::create_dir_all(parent)?;
+                    std::fs::rename(&staged_path, &path)?;
+                    self.connection.execute(
+                        "INSERT OR REPLACE INTO parquet_symbol_exports VALUES (?, ?, ?, now())",
+                        params![table, symbol, start],
+                    )?;
+                    files.push(ExportFile {
+                        table: (*table).to_owned(),
+                        symbol: symbol.clone(),
+                        path,
+                    });
                 }
-                let path = directory
-                    .join(&symbol)
-                    .join(*table)
-                    .join(start.format("%Y-%m-%d").to_string())
-                    .join(start.format("%H").to_string())
-                    .join("data.parquet");
-                let parent = path.parent().context("Parquet path has no parent")?;
-                std::fs::create_dir_all(parent)?;
-                std::fs::rename(&staged_path, &path)?;
-                self.connection.execute(
-                    "INSERT OR REPLACE INTO parquet_symbol_exports VALUES (?, ?, ?, now())",
-                    params![table, &symbol, start],
-                )?;
-                files.push(ExportFile {
-                    table: (*table).to_owned(),
-                    symbol,
-                    path,
-                });
             }
             std::fs::remove_dir_all(&staging_directory)?;
         }
@@ -343,6 +345,34 @@ mod tests {
             storage.export_hour(start, start + chrono::Duration::hours(1), &parquet, false)?;
 
         assert!(files.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn export_hour_should_write_multiple_symbol_batches() -> Result<()> {
+        let temporary = tempdir()?;
+        let database = temporary.path().join("market.duckdb");
+        let parquet = temporary.path().join("parquet");
+        let start = Utc
+            .with_ymd_and_hms(2026, 8, 3, 4, 0, 0)
+            .single()
+            .context("invalid test time")?;
+        let mut storage = Storage::open(&database)?;
+        let mut records = Vec::new();
+        for index in 0..101 {
+            let symbol = format!("TEST{index}USDT");
+            let payload = format!(
+                r#"{{"stream":"{}@aggTrade","data":{{"e":"aggTrade","E":1785731400000,"s":"{symbol}","a":1,"p":"1","q":"2","f":1,"l":1,"T":1785731400000,"m":false,"M":true}}}}"#,
+                symbol.to_ascii_lowercase()
+            );
+            records.extend(parser::parse(payload.as_bytes(), start, "websocket")?);
+        }
+        storage.insert(&records)?;
+
+        let files =
+            storage.export_hour(start, start + chrono::Duration::hours(1), &parquet, false)?;
+
+        assert_eq!(files.len(), 101);
         Ok(())
     }
 }
