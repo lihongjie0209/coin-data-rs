@@ -78,9 +78,6 @@ impl Archiver {
 
     pub async fn export(&self, hour: DateTime<Utc>, force: bool) -> Result<Vec<String>> {
         let hour = floor_hour(hour)?;
-        if hour >= floor_hour(Utc::now())? {
-            bail!("the active hour cannot be uploaded");
-        }
         let item = ClosedDatabase {
             hour,
             path: self.writer.database_path(hour),
@@ -105,6 +102,9 @@ impl Archiver {
 
     async fn upload(&self, item: ClosedDatabase, force: bool) -> Result<String> {
         let _guard = self.upload_lock.lock().await;
+        if !is_uploadable(item.hour, self.writer.active_hour()?) {
+            bail!("the active or future hour cannot be uploaded");
+        }
         if !item.path.is_file() {
             bail!("hourly database does not exist: {}", item.path.display());
         }
@@ -254,7 +254,7 @@ impl Archiver {
     }
 
     async fn upload_pending(&self) -> Result<()> {
-        let current = floor_hour(Utc::now())?;
+        let active_hour = self.writer.active_hour()?;
         for entry in walk_files(self.writer.directory())? {
             if entry.extension().and_then(|v| v.to_str()) != Some("duckdb") {
                 continue;
@@ -262,7 +262,8 @@ impl Archiver {
             let Some(hour) = hour_from_path(&entry) else {
                 continue;
             };
-            if hour < current && !entry.with_extension("duckdb.uploaded").exists() {
+            if is_uploadable(hour, active_hour) && !entry.with_extension("duckdb.uploaded").exists()
+            {
                 self.upload_with_retry(ClosedDatabase { hour, path: entry })
                     .await;
             }
@@ -298,6 +299,10 @@ impl Archiver {
         }
         Ok(())
     }
+}
+
+fn is_uploadable(hour: DateTime<Utc>, active_hour: DateTime<Utc>) -> bool {
+    hour < active_hour
 }
 
 fn walk_files(root: &Path) -> Result<Vec<PathBuf>> {
@@ -336,5 +341,17 @@ mod tests {
             parsed.map(|value| value.to_rfc3339()),
             Some("2026-08-03T12:00:00+00:00".to_owned())
         );
+    }
+
+    #[test]
+    fn uploadability_follows_writer_hour_instead_of_wall_clock() -> Result<()> {
+        let active = DateTime::parse_from_rfc3339("2026-08-03T14:00:00Z")?.to_utc();
+        let closed = active - chrono::Duration::hours(1);
+        let future = active + chrono::Duration::hours(1);
+
+        assert!(is_uploadable(closed, active));
+        assert!(!is_uploadable(active, active));
+        assert!(!is_uploadable(future, active));
+        Ok(())
     }
 }

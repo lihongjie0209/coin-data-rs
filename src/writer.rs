@@ -1,6 +1,9 @@
 use std::{
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicI64, Ordering},
+    },
     time::Duration,
 };
 
@@ -33,6 +36,7 @@ pub struct Writer {
     metrics: Arc<Metrics>,
     directory: PathBuf,
     exchange: String,
+    active_hour_timestamp: Arc<AtomicI64>,
 }
 
 impl Writer {
@@ -55,8 +59,10 @@ impl Writer {
 
         let (sender, receiver) = mpsc::channel(capacity);
         let (closed_sender, closed_receiver) = mpsc::unbounded_channel();
+        let active_hour_timestamp = Arc::new(AtomicI64::new(hour.timestamp()));
         let run_directory = directory.clone();
         let run_metrics = Arc::clone(&metrics);
+        let run_active_hour_timestamp = Arc::clone(&active_hour_timestamp);
         tokio::task::spawn_blocking(move || {
             if let Err(error) = run(
                 run_directory,
@@ -65,6 +71,7 @@ impl Writer {
                 closed_sender,
                 batch_size,
                 &run_metrics,
+                &run_active_hour_timestamp,
             ) {
                 tracing::error!(error = %format!("{error:#}"), "database writer stopped");
             }
@@ -101,6 +108,7 @@ impl Writer {
                 metrics,
                 directory,
                 exchange,
+                active_hour_timestamp,
             },
             closed_receiver,
         ))
@@ -139,6 +147,11 @@ impl Writer {
         &self.exchange
     }
 
+    pub fn active_hour(&self) -> Result<DateTime<Utc>> {
+        DateTime::from_timestamp(self.active_hour_timestamp.load(Ordering::Acquire), 0)
+            .context("invalid active database hour")
+    }
+
     fn observe_queue(&self) {
         let used = self
             .sender
@@ -155,6 +168,7 @@ fn run(
     closed_sender: mpsc::UnboundedSender<ClosedDatabase>,
     batch_size: usize,
     metrics: &Metrics,
+    active_hour_timestamp: &AtomicI64,
 ) -> Result<()> {
     let mut storage = Storage::open_existing(&hourly_path(&directory, hour))?;
     let mut pending = Vec::with_capacity(batch_size);
@@ -185,6 +199,7 @@ fn run(
                 ))?;
                 storage = Storage::open_existing(&hourly_path(&directory, next_hour))?;
                 hour = next_hour;
+                active_hour_timestamp.store(hour.timestamp(), Ordering::Release);
                 let _ = closed_sender.send(closed);
             }
             Command::Stats(response) => {
@@ -276,6 +291,7 @@ mod tests {
             .await?
             .context("rotation notification missing")?;
         assert_eq!(item.hour, current);
+        assert_eq!(writer.active_hour()?, next);
         assert!(item.path.is_file());
         assert!(writer.database_path(next).is_file());
         assert!(
