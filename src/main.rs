@@ -38,7 +38,7 @@ async fn main() -> Result<()> {
         config.batch_size,
         config.flush_interval(),
         Arc::clone(&metrics),
-    );
+    )?;
     let backfiller = Backfiller::new(config.rest_url.clone(), symbols.clone(), writer.clone());
     backfiller.clone().spawn();
     let notifier = TelegramNotifier::from_env(Arc::clone(&metrics));

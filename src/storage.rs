@@ -42,6 +42,14 @@ impl Storage {
         Ok(Self { connection })
     }
 
+    pub fn open_existing(path: &Path) -> Result<Self> {
+        let connection = Connection::open(path).context("open DuckDB")?;
+        connection.execute_batch(
+            "SET TimeZone='UTC'; SET memory_limit='512MB'; SET threads=1; SET preserve_insertion_order=false;",
+        )?;
+        Ok(Self { connection })
+    }
+
     pub fn insert(&mut self, records: &[Record]) -> Result<usize> {
         if records.is_empty() {
             return Ok(0);
