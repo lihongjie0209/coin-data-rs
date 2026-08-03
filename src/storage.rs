@@ -110,7 +110,7 @@ fn configure(connection: &Connection) -> Result<()> {
          SET memory_limit='160MB';
          SET threads=1;
          SET preserve_insertion_order=false;
-         SET checkpoint_threshold='1GB';",
+         SET checkpoint_threshold='16GB';",
     )?;
     Ok(())
 }
