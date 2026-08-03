@@ -23,17 +23,6 @@ pub enum Command {
         resume: Arc<(Mutex<bool>, Condvar)>,
     },
     Shutdown(oneshot::Sender<Result<()>>),
-}
-
-struct SnapshotResumeGuard(Arc<(Mutex<bool>, Condvar)>);
-
-impl Drop for SnapshotResumeGuard {
-    fn drop(&mut self) {
-        resume_snapshot_writer(&self.0);
-    }
-}
-
-enum MaintenanceCommand {
     Stats(oneshot::Sender<Result<serde_json::Value>>),
     Query {
         sql: String,
@@ -50,10 +39,17 @@ enum MaintenanceCommand {
     },
 }
 
+struct SnapshotResumeGuard(Arc<(Mutex<bool>, Condvar)>);
+
+impl Drop for SnapshotResumeGuard {
+    fn drop(&mut self) {
+        resume_snapshot_writer(&self.0);
+    }
+}
+
 #[derive(Clone)]
 pub struct Writer {
     sender: mpsc::Sender<Command>,
-    maintenance: mpsc::Sender<MaintenanceCommand>,
     database: PathBuf,
     metrics: Arc<Metrics>,
 }
@@ -68,18 +64,11 @@ impl Writer {
     ) -> Result<Self> {
         Storage::open(&database).context("initialize database")?;
         let (sender, receiver) = mpsc::channel(capacity);
-        let (maintenance, maintenance_receiver) = mpsc::channel(1_024);
         let writer_database = database.clone();
-        let maintenance_database = database.clone();
         let writer_metrics = Arc::clone(&metrics);
         tokio::task::spawn_blocking(move || {
             if let Err(error) = run(database, receiver, batch_size, &writer_metrics) {
                 tracing::error!(%error, "database writer stopped");
-            }
-        });
-        tokio::task::spawn_blocking(move || {
-            if let Err(error) = run_maintenance(maintenance_database, maintenance_receiver) {
-                tracing::error!(%error, "database maintenance worker stopped");
             }
         });
         let flush_sender = sender.clone();
@@ -95,7 +84,6 @@ impl Writer {
         });
         Ok(Self {
             sender,
-            maintenance,
             database: writer_database,
             metrics,
         })
@@ -114,9 +102,7 @@ impl Writer {
 
     pub async fn stats(&self) -> Result<serde_json::Value> {
         let (response, result) = oneshot::channel();
-        self.maintenance
-            .send(MaintenanceCommand::Stats(response))
-            .await?;
+        self.sender.send(Command::Stats(response)).await?;
         result
             .await
             .context("database maintenance dropped response")?
@@ -124,9 +110,7 @@ impl Writer {
 
     pub async fn query(&self, sql: String) -> Result<serde_json::Value> {
         let (response, result) = oneshot::channel();
-        self.maintenance
-            .send(MaintenanceCommand::Query { sql, response })
-            .await?;
+        self.sender.send(Command::Query { sql, response }).await?;
         result
             .await
             .context("database maintenance dropped response")?
@@ -182,8 +166,8 @@ impl Writer {
 
     pub async fn record_uploads(&self, uploads: Vec<UploadRecord>) -> Result<()> {
         let (response, result) = oneshot::channel();
-        self.maintenance
-            .send(MaintenanceCommand::Upload { uploads, response })
+        self.sender
+            .send(Command::Upload { uploads, response })
             .await?;
         result
             .await
@@ -192,8 +176,8 @@ impl Writer {
 
     pub async fn cleanup(&self, cutoff: DateTime<Utc>, bucket: String) -> Result<usize> {
         let (response, result) = oneshot::channel();
-        self.maintenance
-            .send(MaintenanceCommand::Cleanup {
+        self.sender
+            .send(Command::Cleanup {
                 cutoff,
                 bucket,
                 response,
@@ -232,7 +216,7 @@ fn run(
             Command::Flush => flush(&mut storage, &mut pending, metrics)?,
             other => {
                 flush(&mut storage, &mut pending, metrics)?;
-                if handle(&storage, other)? {
+                if handle(&mut storage, other)? {
                     return Ok(());
                 }
             }
@@ -250,7 +234,7 @@ fn flush(storage: &mut Storage, pending: &mut Vec<Record>, metrics: &Metrics) ->
     Ok(())
 }
 
-fn handle(storage: &Storage, command: Command) -> Result<bool> {
+fn handle(storage: &mut Storage, command: Command) -> Result<bool> {
     match command {
         Command::Barrier(response) => {
             let _ = response.send(Ok(()));
@@ -271,6 +255,22 @@ fn handle(storage: &Storage, command: Command) -> Result<bool> {
         }
         Command::Flush => {}
         Command::Records(_) => {}
+        Command::Stats(response) => {
+            let _ = response.send(storage.stats());
+        }
+        Command::Query { sql, response } => {
+            let _ = response.send(storage.query_json(&sql));
+        }
+        Command::Upload { uploads, response } => {
+            let _ = response.send(storage.record_uploads(&uploads));
+        }
+        Command::Cleanup {
+            cutoff,
+            bucket,
+            response,
+        } => {
+            let _ = response.send(storage.cleanup(cutoff, &bucket));
+        }
     }
     Ok(false)
 }
@@ -280,68 +280,4 @@ fn resume_snapshot_writer(resume: &Arc<(Mutex<bool>, Condvar)>) {
     let mut resumed = lock.lock().unwrap_or_else(|error| error.into_inner());
     *resumed = true;
     condition.notify_one();
-}
-
-fn run_maintenance(
-    database: PathBuf,
-    mut receiver: mpsc::Receiver<MaintenanceCommand>,
-) -> Result<()> {
-    while let Some(command) = receiver.blocking_recv() {
-        // DuckDB connections opened before an Appender commit can retain an old catalog/data
-        // snapshot. Reopen for each low-frequency maintenance request so API queries, gap checks,
-        // and cleanup observe the latest committed writer state without pausing ingestion.
-        let mut storage = match open_maintenance_storage(&database) {
-            Ok(storage) => storage,
-            Err(error) => {
-                let detail = format!("{error:#}");
-                tracing::warn!(error = %detail, "database maintenance request failed to open");
-                match command {
-                    MaintenanceCommand::Stats(response) => {
-                        let _ = response.send(Err(anyhow::anyhow!(detail)));
-                    }
-                    MaintenanceCommand::Query { response, .. } => {
-                        let _ = response.send(Err(anyhow::anyhow!(detail)));
-                    }
-                    MaintenanceCommand::Upload { response, .. } => {
-                        let _ = response.send(Err(anyhow::anyhow!(detail)));
-                    }
-                    MaintenanceCommand::Cleanup { response, .. } => {
-                        let _ = response.send(Err(anyhow::anyhow!(detail)));
-                    }
-                }
-                continue;
-            }
-        };
-        match command {
-            MaintenanceCommand::Stats(response) => {
-                let _ = response.send(storage.stats());
-            }
-            MaintenanceCommand::Query { sql, response } => {
-                let _ = response.send(storage.query_json(&sql));
-            }
-            MaintenanceCommand::Upload { uploads, response } => {
-                let _ = response.send(storage.record_uploads(&uploads));
-            }
-            MaintenanceCommand::Cleanup {
-                cutoff,
-                bucket,
-                response,
-            } => {
-                let _ = response.send(storage.cleanup(cutoff, &bucket));
-            }
-        }
-    }
-    Ok(())
-}
-
-fn open_maintenance_storage(database: &std::path::Path) -> Result<Storage> {
-    let mut last_error = None;
-    for _ in 0..20 {
-        match Storage::open_existing(database) {
-            Ok(storage) => return Ok(storage),
-            Err(error) => last_error = Some(error),
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("open DuckDB failed")))
 }
