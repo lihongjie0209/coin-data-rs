@@ -6,7 +6,9 @@ DuckDB is dynamically linked. Release archives contain the matching `libduckdb.s
 
 The receiver and database writer are separated by a bounded asynchronous channel. DuckDB writes run
 on a dedicated blocking thread. Export uses a checkpointed snapshot so live ingestion resumes while
-Parquet files are generated and uploaded.
+Parquet files are generated and uploaded. Live ingestion never writes Parquet parts directly. Each
+dataset connection is limited to 160 MiB and may spill analytical work to disk; the bounded writer
+queue prevents an extended database stall from exhausting host memory.
 
 ## Run
 
@@ -17,7 +19,10 @@ cargo run --release -- \
 
 Use `--help` for all settings. By default the process runs `spot`, `usdm`, and `coinm` together and creates `binance-spot.duckdb`, `binance-usdm.duckdb`, and `binance-coinm.duckdb` next to the `--database` path. Set `--all-markets=false --market usdm` to run one market only. The default `--symbols ALL` discovers all currently tradable instruments in each market. The desired connection count defaults to four per market and is automatically increased when Binance's 1024-stream limit requires it. USDⓈ-M high-frequency public streams and regular market streams are routed to their separate endpoints.
 
-Aggregate-trade gaps are checked every ten minutes and immediately before export. Spot uses `/api/v3/aggTrades`; futures use their corresponding `/fapi` or `/dapi` endpoint. Futures open interest is sampled once per minute.
+Aggregate-trade gaps are checked over a bounded time range every ten minutes and over the exact hour
+immediately before export. Audits are serialized so the periodic and pre-export checks cannot run
+twice concurrently. Spot uses `/api/v3/aggTrades`; futures use their corresponding `/fapi` or `/dapi`
+endpoint. Futures open interest is sampled once per minute.
 
 Local structured data is normally retained for at most eight hours. When free disk falls below 20%, uploaded rows older than four hours are reclaimed; data inside the four-hour safety window is never pressure-deleted. All three thresholds are configurable.
 

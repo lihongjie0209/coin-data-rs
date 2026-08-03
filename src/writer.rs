@@ -37,6 +37,13 @@ pub enum Command {
         bucket: String,
         response: oneshot::Sender<Result<usize>>,
     },
+    AggregateTradeGaps {
+        table: &'static str,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+        limit: usize,
+        response: oneshot::Sender<Result<Vec<crate::storage::AggregateTradeGap>>>,
+    },
 }
 
 struct SnapshotResumeGuard(Arc<(Mutex<bool>, Condvar)>);
@@ -188,6 +195,28 @@ impl Writer {
             .context("database maintenance dropped response")?
     }
 
+    pub async fn aggregate_trade_gaps(
+        &self,
+        table: &'static str,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+        limit: usize,
+    ) -> Result<Vec<crate::storage::AggregateTradeGap>> {
+        let (response, result) = oneshot::channel();
+        self.sender
+            .send(Command::AggregateTradeGaps {
+                table,
+                start,
+                end,
+                limit,
+                response,
+            })
+            .await?;
+        result
+            .await
+            .context("database writer dropped gap response")?
+    }
+
     fn observe_queue(&self) {
         let used = self
             .sender
@@ -210,27 +239,35 @@ fn run(
             Command::Records(mut records) => {
                 pending.append(&mut records);
                 if pending.len() >= batch_size {
-                    flush(&mut storage, &mut pending, metrics)?;
+                    flush(&mut storage, &mut pending, batch_size, metrics)?;
                 }
             }
-            Command::Flush => flush(&mut storage, &mut pending, metrics)?,
+            Command::Flush => flush(&mut storage, &mut pending, batch_size, metrics)?,
             other => {
-                flush(&mut storage, &mut pending, metrics)?;
+                flush(&mut storage, &mut pending, batch_size, metrics)?;
                 if handle(&mut storage, other)? {
                     return Ok(());
                 }
             }
         }
     }
-    flush(&mut storage, &mut pending, metrics)
+    flush(&mut storage, &mut pending, batch_size, metrics)
 }
 
-fn flush(storage: &mut Storage, pending: &mut Vec<Record>, metrics: &Metrics) -> Result<()> {
+fn flush(
+    storage: &mut Storage,
+    pending: &mut Vec<Record>,
+    batch_size: usize,
+    metrics: &Metrics,
+) -> Result<()> {
     let written = storage.insert(pending)?;
     metrics
         .written_records
         .fetch_add(written as u64, std::sync::atomic::Ordering::Relaxed);
     pending.clear();
+    if pending.capacity() > batch_size.saturating_mul(2) {
+        pending.shrink_to(batch_size);
+    }
     Ok(())
 }
 
@@ -270,6 +307,15 @@ fn handle(storage: &mut Storage, command: Command) -> Result<bool> {
             response,
         } => {
             let _ = response.send(storage.cleanup(cutoff, &bucket));
+        }
+        Command::AggregateTradeGaps {
+            table,
+            start,
+            end,
+            limit,
+            response,
+        } => {
+            let _ = response.send(storage.aggregate_trade_gaps(table, start, end, limit));
         }
     }
     Ok(false)

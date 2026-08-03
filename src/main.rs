@@ -63,12 +63,7 @@ async fn start_dataset(config: Config) -> Result<DatasetState> {
         Arc::clone(&metrics),
     )?;
     let backfiller = if config.exchange == coin_data_rs::config::Exchange::Binance {
-        let backfiller = Backfiller::new(
-            config.rest_url(),
-            symbols.clone(),
-            writer.clone(),
-            config.market,
-        );
+        let backfiller = Backfiller::new(config.rest_url(), writer.clone(), config.market);
         backfiller.clone().spawn();
         Some(backfiller)
     } else {

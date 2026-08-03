@@ -91,7 +91,7 @@ pub struct Config {
     pub parquet_dir: PathBuf,
     #[arg(long, default_value_t = 5_000)]
     pub batch_size: usize,
-    #[arg(long, default_value_t = 100_000)]
+    #[arg(long, default_value_t = 20_000)]
     pub queue_capacity: usize,
     #[arg(long, default_value_t = 1)]
     flush_seconds: u64,

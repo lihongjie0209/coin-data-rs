@@ -86,15 +86,18 @@ impl Archiver {
     async fn export_inner(&self, start: DateTime<Utc>, force: bool) -> Result<ArchiveReport> {
         std::fs::create_dir_all(&self.directory).context("create parquet directory")?;
         self.cleanup().await?;
-        if let Some(backfiller) = &self.backfiller {
-            backfiller.run().await.context("pre-export backfill")?;
-        }
         let start = start
             .with_minute(0)
             .and_then(|value| value.with_second(0))
             .and_then(|value| value.with_nanosecond(0))
             .context("invalid archive hour")?;
         let end = start + chrono::Duration::hours(1);
+        if let Some(backfiller) = &self.backfiller {
+            backfiller
+                .run_range(start, end)
+                .await
+                .context("pre-export backfill")?;
+        }
         let files = self
             .writer
             .export(start, end, self.directory.clone(), force)
@@ -205,7 +208,7 @@ impl Archiver {
                     .and_then(|value| value.with_nanosecond(0));
                 let Some(hour) = hour else { continue };
                 if let Err(error) = self.export(hour, false).await {
-                    tracing::error!(%error, %hour, "hourly archive failed");
+                    tracing::error!(error = %format!("{error:#}"), %hour, "hourly archive failed");
                 }
             }
         });
