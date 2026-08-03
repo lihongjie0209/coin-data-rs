@@ -79,7 +79,7 @@ pub struct Config {
     rest_url: Option<String>,
     #[arg(long, default_value = "data/market.duckdb")]
     pub database: PathBuf,
-    #[arg(long, default_value_t = 5_000)]
+    #[arg(long, default_value_t = 20_000)]
     pub batch_size: usize,
     #[arg(long, default_value_t = 20_000)]
     pub queue_capacity: usize,

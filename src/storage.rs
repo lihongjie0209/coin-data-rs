@@ -46,13 +46,15 @@ impl Storage {
         for record in records {
             grouped.entry(record.table).or_default().push(record);
         }
+        let transaction = self.connection.transaction()?;
         for (table, records) in grouped {
-            let mut appender = self.connection.appender(table)?;
+            let mut appender = transaction.appender(table)?;
             for record in records {
                 appender.append_row(appender_params_from_iter(record.values.iter()))?;
             }
             appender.flush().with_context(|| format!("flush {table}"))?;
         }
+        transaction.commit()?;
         Ok(records.len())
     }
 
