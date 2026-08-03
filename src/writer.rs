@@ -18,14 +18,8 @@ pub enum Command {
         sql: String,
         response: oneshot::Sender<Result<Value>>,
     },
-    Export {
-        start: DateTime<Utc>,
-        end: DateTime<Utc>,
-        directory: PathBuf,
-        force: bool,
-        response: oneshot::Sender<Result<Vec<ExportFile>>>,
-    },
     Flush,
+    Barrier(oneshot::Sender<Result<()>>),
     Upload {
         uploads: Vec<UploadRecord>,
         response: oneshot::Sender<Result<()>>,
@@ -41,6 +35,8 @@ pub enum Command {
 #[derive(Clone)]
 pub struct Writer {
     sender: mpsc::Sender<Command>,
+    database: PathBuf,
+    metrics: Arc<Metrics>,
 }
 
 impl Writer {
@@ -52,8 +48,10 @@ impl Writer {
         metrics: Arc<Metrics>,
     ) -> Self {
         let (sender, receiver) = mpsc::channel(capacity);
+        let writer_database = database.clone();
+        let writer_metrics = Arc::clone(&metrics);
         tokio::task::spawn_blocking(move || {
-            if let Err(error) = run(database, receiver, batch_size, &metrics) {
+            if let Err(error) = run(database, receiver, batch_size, &writer_metrics) {
                 tracing::error!(%error, "database writer stopped");
             }
         });
@@ -68,14 +66,22 @@ impl Writer {
                 }
             }
         });
-        Self { sender }
+        Self {
+            sender,
+            database: writer_database,
+            metrics,
+        }
     }
 
     pub async fn records(&self, records: Vec<Record>) -> Result<()> {
-        self.sender
+        self.observe_queue();
+        let result = self
+            .sender
             .send(Command::Records(records))
             .await
-            .context("database writer stopped")
+            .context("database writer stopped");
+        self.observe_queue();
+        result
     }
 
     pub async fn stats(&self) -> Result<Value> {
@@ -98,16 +104,15 @@ impl Writer {
         force: bool,
     ) -> Result<Vec<ExportFile>> {
         let (response, result) = oneshot::channel();
-        self.sender
-            .send(Command::Export {
-                start,
-                end,
-                directory,
-                force,
-                response,
-            })
-            .await?;
-        result.await.context("database writer dropped response")?
+        self.sender.send(Command::Barrier(response)).await?;
+        result.await.context("database writer dropped barrier")??;
+        let database = self.database.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut storage = Storage::open(&database)?;
+            storage.export_hour(start, end, &directory, force)
+        })
+        .await
+        .context("Parquet export task failed")?
     }
 
     pub async fn record_uploads(&self, uploads: Vec<UploadRecord>) -> Result<()> {
@@ -128,6 +133,14 @@ impl Writer {
             })
             .await?;
         result.await.context("database writer dropped response")?
+    }
+
+    fn observe_queue(&self) {
+        let used = self
+            .sender
+            .max_capacity()
+            .saturating_sub(self.sender.capacity());
+        self.metrics.observe_writer_queue(used as u64);
     }
 }
 
@@ -176,14 +189,8 @@ fn handle(storage: &mut Storage, command: Command) -> Result<bool> {
         Command::Query { sql, response } => {
             let _ = response.send(storage.query_json(&sql));
         }
-        Command::Export {
-            start,
-            end,
-            directory,
-            force,
-            response,
-        } => {
-            let _ = response.send(storage.export_hour(start, end, &directory, force));
+        Command::Barrier(response) => {
+            let _ = response.send(Ok(()));
         }
         Command::Shutdown(response) => {
             let _ = response.send(Ok(()));

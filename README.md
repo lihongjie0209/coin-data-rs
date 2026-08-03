@@ -4,7 +4,9 @@ Rust implementation of a Binance Spot real-time market-data collector. It consum
 
 DuckDB is dynamically linked. Release archives contain the matching `libduckdb.so`; install it under `/usr/local/lib/coin-data-rs` (the systemd unit sets `LD_LIBRARY_PATH`). The server does not need GCC or a Rust toolchain.
 
-The receiver and database writer are separated by a bounded asynchronous channel. DuckDB work runs on a dedicated blocking thread. Query/export requests enter the same ordered command stream, so an export sees every write accepted before its barrier without waiting for live traffic to stop.
+The receiver and database writer are separated by a bounded asynchronous channel. DuckDB writes run
+on a dedicated blocking thread. An export first crosses an ordered flush barrier, then uses a separate
+DuckDB connection so live writes continue while Parquet files are generated and uploaded.
 
 ## Run
 

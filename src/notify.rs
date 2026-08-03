@@ -50,7 +50,7 @@ impl TelegramNotifier {
         let disk_total = fs2::total_space(report.data_directory).unwrap_or_default();
         let disk_available = fs2::available_space(report.data_directory).unwrap_or_default();
         let mut text = format!(
-            "Parquet {}\nhour: {}\nfiles: {}\ndata: {}\nelapsed: {:.1}s\nrecords: received={} parsed={} written={} dropped={} errors={} reconnects={}\nload1: {load}\nmemory: {} / {}\ndisk: {} free / {}",
+            "Parquet {}\nhour: {}\nfiles: {}\ndata: {}\nelapsed: {:.1}s\nrecords: received={} parsed={} written={} dropped={} errors={} reconnects={}\nwriter queue: current={} peak={}\nlast message: {}\nload1: {load}\nmemory: {} / {}\ndisk: {} free / {}",
             report.status,
             report.hour,
             report.files,
@@ -62,6 +62,9 @@ impl TelegramNotifier {
             runtime.dropped_messages,
             runtime.parse_errors,
             runtime.reconnects,
+            runtime.writer_queue_depth,
+            runtime.writer_queue_high_watermark,
+            runtime.last_message_unix_ms,
             human_bytes(memory_used),
             human_bytes(memory_total),
             human_bytes(disk_available),

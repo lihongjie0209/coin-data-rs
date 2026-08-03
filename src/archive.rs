@@ -26,6 +26,7 @@ pub struct Archiver {
     max_retention_hours: u64,
     min_free_disk_percent: u64,
     notifier: TelegramNotifier,
+    export_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl Archiver {
@@ -50,10 +51,12 @@ impl Archiver {
             max_retention_hours: config.max_retention_hours,
             min_free_disk_percent: config.min_free_disk_percent,
             notifier,
+            export_lock: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
     pub async fn export(&self, start: DateTime<Utc>, force: bool) -> Result<Vec<String>> {
+        let _guard = self.export_lock.lock().await;
         let started = Instant::now();
         let result = self.export_inner(start, force).await;
         let (status, files, bytes, error) = match &result {
@@ -93,7 +96,7 @@ impl Archiver {
             .export(start, end, self.directory.clone(), force)
             .await?;
         let uploads = stream::iter(files.into_iter().map(|file| self.upload_file(file, start)))
-            .buffer_unordered(16)
+            .buffer_unordered(8)
             .try_collect::<Vec<_>>()
             .await?;
         let keys = uploads

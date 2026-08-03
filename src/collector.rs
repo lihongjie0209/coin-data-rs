@@ -65,6 +65,10 @@ async fn collect(
         metrics
             .received_messages
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        metrics.last_message_unix_ms.store(
+            Utc::now().timestamp_millis().max(0) as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
         match parser::parse(&payload, Utc::now(), "websocket") {
             Ok(records) if !records.is_empty() => {
                 metrics
