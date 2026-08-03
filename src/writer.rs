@@ -5,7 +5,11 @@ use chrono::{DateTime, Utc};
 use serde_json::Value;
 use tokio::sync::{mpsc, oneshot};
 
-use crate::{model::Record, runtime::Metrics, storage::Storage};
+use crate::{
+    model::Record,
+    runtime::Metrics,
+    storage::{ExportFile, Storage, UploadRecord},
+};
 
 pub enum Command {
     Records(Vec<Record>),
@@ -19,16 +23,11 @@ pub enum Command {
         end: DateTime<Utc>,
         directory: PathBuf,
         force: bool,
-        response: oneshot::Sender<Result<Vec<PathBuf>>>,
+        response: oneshot::Sender<Result<Vec<ExportFile>>>,
     },
     Flush,
     Upload {
-        table: String,
-        start: DateTime<Utc>,
-        bucket: String,
-        key: String,
-        etag: String,
-        size: u64,
+        uploads: Vec<UploadRecord>,
         response: oneshot::Sender<Result<()>>,
     },
     Cleanup {
@@ -97,7 +96,7 @@ impl Writer {
         end: DateTime<Utc>,
         directory: PathBuf,
         force: bool,
-    ) -> Result<Vec<PathBuf>> {
+    ) -> Result<Vec<ExportFile>> {
         let (response, result) = oneshot::channel();
         self.sender
             .send(Command::Export {
@@ -111,26 +110,10 @@ impl Writer {
         result.await.context("database writer dropped response")?
     }
 
-    pub async fn record_upload(
-        &self,
-        table: String,
-        start: DateTime<Utc>,
-        bucket: String,
-        key: String,
-        etag: String,
-        size: u64,
-    ) -> Result<()> {
+    pub async fn record_uploads(&self, uploads: Vec<UploadRecord>) -> Result<()> {
         let (response, result) = oneshot::channel();
         self.sender
-            .send(Command::Upload {
-                table,
-                start,
-                bucket,
-                key,
-                etag,
-                size,
-                response,
-            })
+            .send(Command::Upload { uploads, response })
             .await?;
         result.await.context("database writer dropped response")?
     }
@@ -207,16 +190,8 @@ fn handle(storage: &mut Storage, command: Command) -> Result<bool> {
             return Ok(true);
         }
         Command::Flush => {}
-        Command::Upload {
-            table,
-            start,
-            bucket,
-            key,
-            etag,
-            size,
-            response,
-        } => {
-            let _ = response.send(storage.record_upload(&table, start, &bucket, &key, &etag, size));
+        Command::Upload { uploads, response } => {
+            let _ = response.send(storage.record_uploads(&uploads));
         }
         Command::Cleanup {
             cutoff,

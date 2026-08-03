@@ -34,6 +34,15 @@ curl -X POST http://127.0.0.1:8081/v1/archive \
 
 The SQL endpoint intentionally accepts arbitrary SQL and must remain private.
 
+Hourly Parquet objects are partitioned by table and symbol:
+
+```text
+parquet/rust/BTCUSDT/aggregate_trades/2026-08-03/04/data.parquet
+```
+
+Only table/symbol/hour partitions containing rows produce files. Every source field, including
+`symbol`, remains present in each Parquet file.
+
 ## Tables
 
 `depth_updates`, `depth_levels`, `aggregate_trades`, `trades`, `book_tickers`, `tickers`, `rolling_tickers`, `mini_tickers`, `klines`, and `average_prices`. Raw JSON is not retained.

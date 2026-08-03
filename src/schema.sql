@@ -11,4 +11,5 @@ CREATE TABLE IF NOT EXISTS average_prices (event_time TIMESTAMPTZ, received_at T
 CREATE TABLE IF NOT EXISTS parquet_exports (table_name VARCHAR, hour_start TIMESTAMPTZ, exported_at TIMESTAMPTZ, PRIMARY KEY (table_name, hour_start));
 CREATE TABLE IF NOT EXISTS integrity_issues (detected_at TIMESTAMPTZ, hour_start TIMESTAMPTZ, symbol VARCHAR, data_type VARCHAR, first_missing_id UBIGINT, last_missing_id UBIGINT, status VARCHAR, detail VARCHAR);
 CREATE TABLE IF NOT EXISTS parquet_uploads (table_name VARCHAR, hour_start TIMESTAMPTZ, bucket VARCHAR, object_key VARCHAR, etag VARCHAR, size_bytes UBIGINT, uploaded_at TIMESTAMPTZ, PRIMARY KEY (table_name, hour_start, bucket));
-
+CREATE TABLE IF NOT EXISTS parquet_symbol_exports (table_name VARCHAR, symbol VARCHAR, hour_start TIMESTAMPTZ, exported_at TIMESTAMPTZ, PRIMARY KEY (table_name, symbol, hour_start));
+CREATE TABLE IF NOT EXISTS parquet_symbol_uploads (table_name VARCHAR, symbol VARCHAR, hour_start TIMESTAMPTZ, bucket VARCHAR, object_key VARCHAR, etag VARCHAR, size_bytes UBIGINT, uploaded_at TIMESTAMPTZ, PRIMARY KEY (table_name, symbol, hour_start, bucket));

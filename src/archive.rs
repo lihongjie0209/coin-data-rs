@@ -4,8 +4,9 @@ use anyhow::{Context, Result};
 use aws_config::{BehaviorVersion, Region};
 use aws_sdk_s3::{Client, primitives::ByteStream};
 use chrono::{DateTime, Timelike, Utc};
+use futures_util::{StreamExt, TryStreamExt, stream};
 
-use crate::{backfill::Backfiller, config::Config, writer::Writer};
+use crate::{backfill::Backfiller, config::Config, storage::UploadRecord, writer::Writer};
 
 #[derive(Clone)]
 pub struct Archiver {
@@ -53,50 +54,56 @@ impl Archiver {
             .writer
             .export(start, end, self.directory.clone(), force)
             .await?;
-        let mut keys = Vec::with_capacity(files.len());
-        let stamp = start.format("%Y%m%dT%H0000Z").to_string();
-        for path in files {
-            let filename = path
-                .file_name()
-                .context("parquet file has no name")?
-                .to_string_lossy();
-            let key = format!("{}/{}/{filename}", self.prefix, start.format("%Y/%m/%d/%H"));
-            let body = ByteStream::from_path(&path)
-                .await
-                .context("read parquet file")?;
-            let output = self
-                .client
-                .put_object()
-                .bucket(&self.bucket)
-                .key(&key)
-                .body(body)
-                .send()
-                .await?;
-            self.client
-                .head_object()
-                .bucket(&self.bucket)
-                .key(&key)
-                .send()
-                .await?;
-            let suffix = format!("_{stamp}.parquet");
-            let table = filename
-                .strip_suffix(&suffix)
-                .context("unexpected parquet filename")?;
-            let size = std::fs::metadata(&path)?.len();
-            self.writer
-                .record_upload(
-                    table.to_owned(),
-                    start,
-                    self.bucket.clone(),
-                    key.clone(),
-                    output.e_tag().unwrap_or_default().to_owned(),
-                    size,
-                )
-                .await?;
-            keys.push(key);
-        }
+        let uploads = stream::iter(files.into_iter().map(|file| self.upload_file(file, start)))
+            .buffer_unordered(16)
+            .try_collect::<Vec<_>>()
+            .await?;
+        let keys = uploads
+            .iter()
+            .map(|upload| upload.key.clone())
+            .collect::<Vec<_>>();
+        self.writer.record_uploads(uploads).await?;
         self.cleanup().await?;
         Ok(keys)
+    }
+
+    async fn upload_file(
+        &self,
+        file: crate::storage::ExportFile,
+        start: DateTime<Utc>,
+    ) -> Result<UploadRecord> {
+        let relative = file
+            .path
+            .strip_prefix(&self.directory)
+            .context("parquet file is outside archive directory")?;
+        let key = format!("{}/{}", self.prefix, relative.to_string_lossy());
+        let body = ByteStream::from_path(&file.path)
+            .await
+            .context("read parquet file")?;
+        let output = self
+            .client
+            .put_object()
+            .bucket(&self.bucket)
+            .key(&key)
+            .body(body)
+            .send()
+            .await?;
+        self.client
+            .head_object()
+            .bucket(&self.bucket)
+            .key(&key)
+            .send()
+            .await?;
+        let size = std::fs::metadata(&file.path)?.len();
+        Ok(UploadRecord {
+            table: file.table,
+            symbol: file.symbol,
+            start,
+            bucket: self.bucket.clone(),
+            key,
+            etag: output.e_tag().unwrap_or_default().to_owned(),
+            size,
+        })
     }
 
     async fn cleanup(&self) -> Result<()> {

@@ -10,6 +10,23 @@ pub struct Storage {
     connection: Connection,
 }
 
+#[derive(Debug)]
+pub struct ExportFile {
+    pub table: String,
+    pub symbol: String,
+    pub path: PathBuf,
+}
+
+pub struct UploadRecord {
+    pub table: String,
+    pub symbol: String,
+    pub start: DateTime<Utc>,
+    pub bucket: String,
+    pub key: String,
+    pub etag: String,
+    pub size: u64,
+}
+
 impl Storage {
     pub fn open(path: &Path) -> Result<Self> {
         if let Some(parent) = path.parent() {
@@ -87,52 +104,114 @@ impl Storage {
         end: DateTime<Utc>,
         directory: &Path,
         force: bool,
-    ) -> Result<Vec<PathBuf>> {
+    ) -> Result<Vec<ExportFile>> {
         std::fs::create_dir_all(directory).context("create parquet directory")?;
-        let stamp = start.format("%Y%m%dT%H0000Z");
-        let mut files = Vec::with_capacity(TABLES.len());
+        let mut files = Vec::new();
         for table in TABLES {
-            let already_exported: bool = self.connection.query_row(
-                "SELECT count(*) > 0 FROM parquet_exports WHERE table_name=? AND hour_start=?",
-                params![table, start],
-                |row| row.get(0),
-            )?;
-            if already_exported && !force {
+            let time_column = time_column(table);
+            let symbols = self.symbols_to_export(table, time_column, start, end, force)?;
+            if symbols.is_empty() {
                 continue;
             }
-            let path = directory.join(format!("{table}_{stamp}.parquet"));
-            let time_column = if *table == "book_tickers" {
-                "received_at"
-            } else {
-                "event_time"
-            };
-            let safe_path = path.to_string_lossy().replace('\'', "''");
+            let staging_directory = directory
+                .join(".staging")
+                .join(format!("{table}_{}", start.format("%Y%m%dT%H")));
+            if staging_directory.exists() {
+                std::fs::remove_dir_all(&staging_directory)?;
+            }
+            std::fs::create_dir_all(&staging_directory)?;
+            let safe_path = staging_directory.to_string_lossy().replace('\'', "''");
+            let symbol_list = symbols
+                .iter()
+                .map(|symbol| format!("'{}'", symbol.replace('\'', "''")))
+                .collect::<Vec<_>>()
+                .join(",");
             let sql = format!(
-                "COPY (SELECT * FROM {table} WHERE {time_column} >= ? AND {time_column} < ? ORDER BY {time_column}) TO '{safe_path}' (FORMAT PARQUET, COMPRESSION ZSTD)"
+                "COPY (SELECT *, strftime({time_column}, '%Y-%m-%d') AS date, strftime({time_column}, '%H') AS hour FROM {table} WHERE {time_column} >= ? AND {time_column} < ? AND symbol IN ({symbol_list}) ORDER BY symbol, {time_column}) TO '{safe_path}' (FORMAT PARQUET, COMPRESSION ZSTD, PARTITION_BY (symbol, date, hour), WRITE_PARTITION_COLUMNS, OVERWRITE_OR_IGNORE, FILENAME_PATTERN 'data_{{i}}')"
             );
             self.connection.execute(&sql, params![start, end])?;
-            self.connection.execute(
-                "INSERT OR REPLACE INTO parquet_exports VALUES (?, ?, now())",
-                params![table, start],
-            )?;
-            files.push(path);
+            for symbol in symbols {
+                let staged_path = staging_directory
+                    .join(format!("symbol={symbol}"))
+                    .join(format!("date={}", start.format("%Y-%m-%d")))
+                    .join(format!("hour={}", start.format("%H")))
+                    .join("data_0.parquet");
+                if !staged_path.is_file() {
+                    anyhow::bail!("DuckDB did not create {}", staged_path.display());
+                }
+                let path = directory
+                    .join(&symbol)
+                    .join(*table)
+                    .join(start.format("%Y-%m-%d").to_string())
+                    .join(start.format("%H").to_string())
+                    .join("data.parquet");
+                let parent = path.parent().context("Parquet path has no parent")?;
+                std::fs::create_dir_all(parent)?;
+                std::fs::rename(&staged_path, &path)?;
+                self.connection.execute(
+                    "INSERT OR REPLACE INTO parquet_symbol_exports VALUES (?, ?, ?, now())",
+                    params![table, &symbol, start],
+                )?;
+                files.push(ExportFile {
+                    table: (*table).to_owned(),
+                    symbol,
+                    path,
+                });
+            }
+            std::fs::remove_dir_all(&staging_directory)?;
         }
         Ok(files)
     }
 
-    pub fn record_upload(
+    fn symbols_to_export(
         &self,
         table: &str,
+        time_column: &str,
         start: DateTime<Utc>,
-        bucket: &str,
-        key: &str,
-        etag: &str,
-        size: u64,
-    ) -> Result<()> {
-        self.connection.execute(
-            "INSERT OR REPLACE INTO parquet_uploads VALUES (?, ?, ?, ?, ?, ?, now())",
-            params![table, start, bucket, key, etag, size],
-        )?;
+        end: DateTime<Utc>,
+        force: bool,
+    ) -> Result<Vec<String>> {
+        let exported_filter = if force {
+            String::new()
+        } else {
+            "AND NOT EXISTS (SELECT 1 FROM parquet_symbol_exports exported WHERE exported.table_name=? AND exported.symbol=data.symbol AND exported.hour_start=?)".to_owned()
+        };
+        let sql = format!(
+            "SELECT DISTINCT symbol FROM {table} data WHERE {time_column} >= ? AND {time_column} < ? {exported_filter} ORDER BY symbol"
+        );
+        let mut statement = self.connection.prepare(&sql)?;
+        let mut symbols = Vec::new();
+        if force {
+            let rows = statement.query_map(params![start, end], |row| row.get(0))?;
+            for symbol in rows {
+                symbols.push(symbol?);
+            }
+        } else {
+            let rows = statement.query_map(params![start, end, table, start], |row| row.get(0))?;
+            for symbol in rows {
+                symbols.push(symbol?);
+            }
+        }
+        Ok(symbols)
+    }
+
+    pub fn record_uploads(&mut self, uploads: &[UploadRecord]) -> Result<()> {
+        let transaction = self.connection.transaction()?;
+        for upload in uploads {
+            transaction.execute(
+                "INSERT OR REPLACE INTO parquet_symbol_uploads VALUES (?, ?, ?, ?, ?, ?, ?, now())",
+                params![
+                    &upload.table,
+                    &upload.symbol,
+                    upload.start,
+                    &upload.bucket,
+                    &upload.key,
+                    &upload.etag,
+                    upload.size
+                ],
+            )?;
+        }
+        transaction.commit()?;
         Ok(())
     }
 
@@ -140,18 +219,22 @@ impl Storage {
         let transaction = self.connection.transaction()?;
         let mut deleted = 0;
         for table in TABLES {
-            let time_column = if *table == "book_tickers" {
-                "received_at"
-            } else {
-                "event_time"
-            };
+            let time_column = time_column(table);
             let sql = format!(
-                "DELETE FROM {table} AS data WHERE {time_column} < ? AND EXISTS (SELECT 1 FROM parquet_uploads AS upload WHERE upload.table_name=? AND upload.bucket=? AND upload.hour_start=date_trunc('hour', data.{time_column}))"
+                "DELETE FROM {table} AS data WHERE {time_column} < ? AND EXISTS (SELECT 1 FROM parquet_symbol_uploads AS upload WHERE upload.table_name=? AND upload.symbol=data.symbol AND upload.bucket=? AND upload.hour_start=date_trunc('hour', data.{time_column}))"
             );
             deleted += transaction.execute(&sql, params![cutoff, table, bucket])?;
         }
         transaction.commit()?;
         Ok(deleted)
+    }
+}
+
+fn time_column(table: &str) -> &'static str {
+    if table == "book_tickers" {
+        "received_at"
+    } else {
+        "event_time"
     }
 }
 
@@ -186,3 +269,78 @@ pub const TABLES: &[&str] = &[
     "klines",
     "average_prices",
 ];
+
+#[cfg(test)]
+mod tests {
+    use chrono::{TimeZone, Utc};
+    use tempfile::tempdir;
+
+    use super::*;
+    use crate::parser;
+
+    #[test]
+    fn export_hour_should_partition_by_symbol_table_date_and_hour() -> Result<()> {
+        let temporary = tempdir()?;
+        let database = temporary.path().join("market.duckdb");
+        let parquet = temporary.path().join("parquet");
+        let start = Utc
+            .with_ymd_and_hms(2026, 8, 3, 4, 0, 0)
+            .single()
+            .context("invalid test time")?;
+        let mut storage = Storage::open(&database)?;
+        let mut records = Vec::new();
+        for symbol in ["BTCUSDT", "ETHUSDT"] {
+            let payload = format!(
+                r#"{{"stream":"{}@aggTrade","data":{{"e":"aggTrade","E":1785731400000,"s":"{symbol}","a":1,"p":"1","q":"2","f":1,"l":1,"T":1785731400000,"m":false,"M":true}}}}"#,
+                symbol.to_ascii_lowercase()
+            );
+            records.extend(parser::parse(payload.as_bytes(), start, "websocket")?);
+        }
+        storage.insert(&records)?;
+
+        let files =
+            storage.export_hour(start, start + chrono::Duration::hours(1), &parquet, false)?;
+
+        assert_eq!(files.len(), 2);
+        for symbol in ["BTCUSDT", "ETHUSDT"] {
+            let path = parquet
+                .join(symbol)
+                .join("aggregate_trades")
+                .join("2026-08-03")
+                .join("04")
+                .join("data.parquet");
+            assert!(path.is_file(), "missing {}", path.display());
+            let exported_symbol: String = storage.connection.query_row(
+                &format!(
+                    "SELECT symbol FROM read_parquet('{}')",
+                    path.to_string_lossy().replace('\'', "''")
+                ),
+                [],
+                |row| row.get(0),
+            )?;
+            assert_eq!(exported_symbol, symbol);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn export_hour_should_skip_already_exported_symbol_partitions() -> Result<()> {
+        let temporary = tempdir()?;
+        let database = temporary.path().join("market.duckdb");
+        let parquet = temporary.path().join("parquet");
+        let start = Utc
+            .with_ymd_and_hms(2026, 8, 3, 4, 0, 0)
+            .single()
+            .context("invalid test time")?;
+        let mut storage = Storage::open(&database)?;
+        let payload = br#"{"stream":"btcusdt@aggTrade","data":{"e":"aggTrade","E":1785731400000,"s":"BTCUSDT","a":1,"p":"1","q":"2","f":1,"l":1,"T":1785731400000,"m":false,"M":true}}"#;
+        storage.insert(&parser::parse(payload, start, "websocket")?)?;
+        storage.export_hour(start, start + chrono::Duration::hours(1), &parquet, false)?;
+
+        let files =
+            storage.export_hour(start, start + chrono::Duration::hours(1), &parquet, false)?;
+
+        assert!(files.is_empty());
+        Ok(())
+    }
+}
