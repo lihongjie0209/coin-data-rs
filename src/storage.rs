@@ -103,14 +103,14 @@ impl Storage {
 }
 
 fn configure(connection: &Connection) -> Result<()> {
-    // Hourly rotation performs an explicit checkpoint. A larger automatic threshold avoids
-    // repeatedly checkpointing a multi-gigabyte active database during ingestion bursts.
+    // The closed hourly connection is checkpointed by a dedicated worker. Keep the automatic
+    // threshold above one hour of WAL so DuckDB cannot checkpoint on the live writer thread.
     connection.execute_batch(
         "SET TimeZone='UTC';
          SET memory_limit='160MB';
          SET threads=1;
          SET preserve_insertion_order=false;
-         SET checkpoint_threshold='4GB';",
+         SET checkpoint_threshold='16GB';",
     )?;
     Ok(())
 }
