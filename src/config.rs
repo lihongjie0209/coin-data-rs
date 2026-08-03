@@ -223,9 +223,24 @@ impl Config {
         Duration::from_secs(self.flush_seconds)
     }
 
-    fn required_connection_count(&self, symbol_count: usize, stream_count: usize) -> usize {
+    fn stream_limit(&self, group: &StreamGroup) -> usize {
+        if (self.exchange, self.market, group.name) == (Exchange::Binance, Market::Usdm, "public") {
+            // Binance's USD-M high-frequency depth/book-ticker endpoint becomes unstable long
+            // before the documented 1,024-stream ceiling on a small collector host.
+            384
+        } else {
+            1_024
+        }
+    }
+
+    fn required_connection_count(
+        &self,
+        symbol_count: usize,
+        stream_count: usize,
+        stream_limit: usize,
+    ) -> usize {
         let required = match self.exchange {
-            Exchange::Binance => (symbol_count * stream_count).div_ceil(1_024),
+            Exchange::Binance => (symbol_count * stream_count).div_ceil(stream_limit),
             Exchange::Okx | Exchange::Bybit => symbol_count.div_ceil(100),
         };
         required.max(1).min(symbol_count)
@@ -239,7 +254,13 @@ impl Config {
         let groups = self.stream_groups();
         let mut counts = groups
             .iter()
-            .map(|group| self.required_connection_count(symbol_count, group.streams.len()))
+            .map(|group| {
+                self.required_connection_count(
+                    symbol_count,
+                    group.streams.len(),
+                    self.stream_limit(group),
+                )
+            })
             .collect::<Vec<_>>();
         let target = self.ws_connections.max(counts.iter().sum());
         while counts.iter().sum::<usize>() < target {
@@ -248,7 +269,8 @@ impl Config {
                 .enumerate()
                 .filter(|(_, count)| **count < symbol_count)
                 .min_by_key(|(index, count)| {
-                    (*count * 1_024).div_ceil(groups[*index].streams.len())
+                    (*count * self.stream_limit(&groups[*index]))
+                        .div_ceil(groups[*index].streams.len())
                 })
             else {
                 break;
@@ -362,4 +384,22 @@ fn csv(value: &str, uppercase: bool) -> Vec<String> {
         }
     }
     values
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn usdm_public_streams_are_split_below_exchange_maximum() {
+        let config = Config::parse_from(["coin-data-rs", "--all-markets=false", "--market=usdm"]);
+        let groups = config.stream_groups();
+        let counts = config.connection_counts(728);
+        let public = groups
+            .iter()
+            .position(|group| group.name == "public")
+            .unwrap_or_default();
+        assert_eq!(counts[public], 4);
+        assert!(728 * groups[public].streams.len() / counts[public] <= 384);
+    }
 }
