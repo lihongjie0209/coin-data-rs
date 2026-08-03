@@ -19,7 +19,7 @@ pub enum Command {
     Flush,
     Barrier(oneshot::Sender<Result<()>>),
     SnapshotBarrier {
-        ready: oneshot::Sender<()>,
+        ready: oneshot::Sender<Result<()>>,
         resume: Arc<(Mutex<bool>, Condvar)>,
     },
     Shutdown(oneshot::Sender<Result<()>>),
@@ -140,48 +140,6 @@ impl Writer {
         force: bool,
     ) -> Result<Vec<ExportFile>> {
         let database = self.database.clone();
-        let (connection_ready_tx, connection_ready_rx) = oneshot::channel();
-        let (begin_snapshot_tx, begin_snapshot_rx) = std::sync::mpsc::sync_channel(0);
-        let (snapshot_started_tx, snapshot_started_rx) = oneshot::channel();
-        let export_task = tokio::task::spawn_blocking(move || {
-            let mut storage = match Storage::open_existing(&database) {
-                Ok(storage) => {
-                    let _ = connection_ready_tx.send(Ok(()));
-                    storage
-                }
-                Err(error) => {
-                    let detail = format!("{error:#}");
-                    let _ = connection_ready_tx.send(Err(detail));
-                    return Err(error);
-                }
-            };
-            begin_snapshot_rx
-                .recv()
-                .context("snapshot start signal dropped")?;
-            if let Err(error) = storage.begin_snapshot() {
-                let detail = format!("{error:#}");
-                let _ = snapshot_started_tx.send(Err(detail));
-                return Err(error);
-            }
-            let _ = snapshot_started_tx.send(Ok(()));
-
-            match storage.export_hour(start, end, &directory, force) {
-                Ok(files) => {
-                    storage.finish_snapshot(true)?;
-                    Ok(files)
-                }
-                Err(error) => {
-                    let _ = storage.finish_snapshot(false);
-                    Err(error)
-                }
-            }
-        });
-
-        connection_ready_rx
-            .await
-            .context("Parquet export task stopped while opening DuckDB")?
-            .map_err(anyhow::Error::msg)?;
-
         let (writer_ready_tx, writer_ready_rx) = oneshot::channel();
         let resume_writer = Arc::new((Mutex::new(false), Condvar::new()));
         self.sender
@@ -191,21 +149,35 @@ impl Writer {
             })
             .await
             .map_err(|_| anyhow::anyhow!("database writer stopped"))?;
+        let resume_guard = SnapshotResumeGuard(resume_writer);
         writer_ready_rx
             .await
-            .context("database writer dropped snapshot barrier")?;
-        let resume_guard = SnapshotResumeGuard(resume_writer);
+            .context("database writer dropped snapshot barrier")??;
 
-        if begin_snapshot_tx.send(()).is_err() {
-            return export_task.await.context("Parquet export task failed")?;
-        }
-        let snapshot_result = snapshot_started_rx.await;
+        let snapshot = database.with_extension(format!(
+            "export-{}-{}.duckdb",
+            std::process::id(),
+            Utc::now().timestamp_millis()
+        ));
+        let source = database.clone();
+        let target = snapshot.clone();
+        tokio::task::spawn_blocking(move || std::fs::copy(&source, &target))
+            .await
+            .context("DuckDB snapshot copy task failed")?
+            .context("copy DuckDB export snapshot")?;
         drop(resume_guard);
-        snapshot_result
-            .context("Parquet export task stopped while starting snapshot")?
-            .map_err(anyhow::Error::msg)?;
 
-        export_task.await.context("Parquet export task failed")?
+        tokio::task::spawn_blocking(move || {
+            let mut storage = Storage::open_existing(&snapshot)?;
+            let result = storage.export_hour(start, end, &directory, force);
+            drop(storage);
+            if let Err(error) = std::fs::remove_file(&snapshot) {
+                tracing::warn!(path = %snapshot.display(), %error, "remove export snapshot failed");
+            }
+            result
+        })
+        .await
+        .context("Parquet export task failed")?
     }
 
     pub async fn record_uploads(&self, uploads: Vec<UploadRecord>) -> Result<()> {
@@ -260,7 +232,7 @@ fn run(
             Command::Flush => flush(&mut storage, &mut pending, metrics)?,
             other => {
                 flush(&mut storage, &mut pending, metrics)?;
-                if handle(other)? {
+                if handle(&storage, other)? {
                     return Ok(());
                 }
             }
@@ -278,13 +250,13 @@ fn flush(storage: &mut Storage, pending: &mut Vec<Record>, metrics: &Metrics) ->
     Ok(())
 }
 
-fn handle(command: Command) -> Result<bool> {
+fn handle(storage: &Storage, command: Command) -> Result<bool> {
     match command {
         Command::Barrier(response) => {
             let _ = response.send(Ok(()));
         }
         Command::SnapshotBarrier { ready, resume } => {
-            let _ = ready.send(());
+            let _ = ready.send(storage.checkpoint());
             let (lock, condition) = &*resume;
             let mut resumed = lock.lock().unwrap_or_else(|error| error.into_inner());
             while !*resumed {
