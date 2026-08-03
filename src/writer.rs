@@ -42,9 +42,14 @@ pub struct Writer {
 }
 
 struct RotationState {
-    checkpoint_sender: std::sync::mpsc::Sender<ClosedDatabase>,
+    checkpoint_sender: std::sync::mpsc::Sender<CheckpointJob>,
     active_hour_timestamp: Arc<AtomicI64>,
     checkpointing: Arc<RwLock<HashSet<PathBuf>>>,
+}
+
+struct CheckpointJob {
+    closed: ClosedDatabase,
+    storage: Storage,
 }
 
 impl Writer {
@@ -221,7 +226,6 @@ fn run(
                     continue;
                 }
                 flush(&mut storage, &mut pending, batch_size, metrics)?;
-                drop(storage);
                 let closed = ClosedDatabase {
                     hour,
                     path: hourly_path(&directory, hour),
@@ -236,15 +240,19 @@ fn run(
                     &directory,
                     next_hour + chrono::Duration::hours(1),
                 ))?;
-                storage = Storage::open_existing(&hourly_path(&directory, next_hour))?;
+                let next_storage = Storage::open_existing(&hourly_path(&directory, next_hour))?;
+                let closed_storage = std::mem::replace(&mut storage, next_storage);
                 hour = next_hour;
                 rotation
                     .active_hour_timestamp
                     .store(hour.timestamp(), Ordering::Release);
                 rotation
                     .checkpoint_sender
-                    .send(closed)
-                    .context("checkpoint worker stopped")?;
+                    .send(CheckpointJob {
+                        closed,
+                        storage: closed_storage,
+                    })
+                    .map_err(|_| anyhow::anyhow!("checkpoint worker stopped"))?;
             }
             Command::Stats(response) => {
                 flush(&mut storage, &mut pending, batch_size, metrics)?;
@@ -268,12 +276,14 @@ fn run(
 }
 
 fn checkpoint_run(
-    receiver: std::sync::mpsc::Receiver<ClosedDatabase>,
+    receiver: std::sync::mpsc::Receiver<CheckpointJob>,
     closed_sender: mpsc::UnboundedSender<ClosedDatabase>,
     checkpointing: &RwLock<HashSet<PathBuf>>,
 ) {
-    while let Ok(closed) = receiver.recv() {
-        let result = Storage::open_existing(&closed.path).and_then(|storage| storage.checkpoint());
+    while let Ok(job) = receiver.recv() {
+        let CheckpointJob { closed, storage } = job;
+        let result = storage.checkpoint();
+        drop(storage);
         if let Ok(mut paths) = checkpointing.write() {
             paths.remove(&closed.path);
         }
