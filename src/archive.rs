@@ -1,7 +1,8 @@
 use std::{
+    future::Future,
     path::{Path, PathBuf},
     sync::Arc,
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, bail};
@@ -20,6 +21,10 @@ use crate::{
     notify::{ArchiveNotification, TelegramNotifier},
     writer::{ClosedDatabase, Writer, floor_hour},
 };
+
+const S3_REQUEST_TIMEOUT: Duration = Duration::from_secs(90);
+const S3_UPLOAD_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+const UPLOAD_RETRY_DELAY: Duration = Duration::from_secs(30);
 
 #[derive(Clone)]
 pub struct Archiver {
@@ -91,7 +96,7 @@ impl Archiver {
                 Ok(_) => return,
                 Err(error) if attempt < 4 => {
                     tracing::warn!(error = %format!("{error:#}"), attempt, path = %item.path.display(), "DuckDB upload will retry");
-                    tokio::time::sleep(std::time::Duration::from_secs(120)).await;
+                    tokio::time::sleep(UPLOAD_RETRY_DELAY).await;
                 }
                 Err(error) => {
                     tracing::error!(error = %format!("{error:#}"), path = %item.path.display(), "DuckDB upload retries exhausted")
@@ -102,8 +107,8 @@ impl Archiver {
 
     async fn upload(&self, item: ClosedDatabase, force: bool) -> Result<String> {
         let _guard = self.upload_lock.lock().await;
-        if !is_uploadable(item.hour, self.writer.active_hour()?) {
-            bail!("the active or future hour cannot be uploaded");
+        if !self.writer.is_archive_ready(item.hour)? {
+            bail!("the database is active, checkpointing, or has pending WAL");
         }
         if !item.path.is_file() {
             bail!("hourly database does not exist: {}", item.path.display());
@@ -158,23 +163,28 @@ impl Archiver {
             let body = ByteStream::from_path(path)
                 .await
                 .context("read hourly DuckDB")?;
-            self.client
-                .put_object()
-                .bucket(&self.bucket)
-                .key(key)
-                .body(body)
-                .send()
-                .await?;
+            await_s3(
+                "put object",
+                self.client
+                    .put_object()
+                    .bucket(&self.bucket)
+                    .key(key)
+                    .body(body)
+                    .send(),
+            )
+            .await?;
             return Ok(());
         }
 
-        let created = self
-            .client
-            .create_multipart_upload()
-            .bucket(&self.bucket)
-            .key(key)
-            .send()
-            .await?;
+        let created = await_s3(
+            "create multipart upload",
+            self.client
+                .create_multipart_upload()
+                .bucket(&self.bucket)
+                .key(key)
+                .send(),
+        )
+        .await?;
         let upload_id = created
             .upload_id()
             .context("S3 omitted multipart upload ID")?;
@@ -199,16 +209,18 @@ impl Archiver {
                         .length(Length::Exact(length))
                         .build()
                         .await?;
-                    let uploaded = self
-                        .client
-                        .upload_part()
-                        .bucket(&self.bucket)
-                        .key(key)
-                        .upload_id(upload_id)
-                        .part_number(part_number)
-                        .body(body)
-                        .send()
-                        .await?;
+                    let uploaded = await_s3(
+                        "upload multipart part",
+                        self.client
+                            .upload_part()
+                            .bucket(&self.bucket)
+                            .key(key)
+                            .upload_id(upload_id)
+                            .part_number(part_number)
+                            .body(body)
+                            .send(),
+                    )
+                    .await?;
                     tracing::debug!(%key, part_number, "multipart part uploaded");
                     Ok::<_, anyhow::Error>(
                         CompletedPart::builder()
@@ -217,36 +229,45 @@ impl Archiver {
                             .build(),
                     )
                 })
-                .buffer_unordered(2)
+                // Keep archive I/O subordinate to the live DuckDB writer on small hosts.
+                .buffer_unordered(1)
                 .try_collect::<Vec<_>>()
                 .await?;
             parts.sort_unstable_by_key(|part| part.part_number());
             let part_count = parts.len();
-            self.client
-                .complete_multipart_upload()
-                .bucket(&self.bucket)
-                .key(key)
-                .upload_id(upload_id)
-                .multipart_upload(
-                    CompletedMultipartUpload::builder()
-                        .set_parts(Some(parts))
-                        .build(),
-                )
-                .send()
-                .await?;
+            await_s3(
+                "complete multipart upload",
+                self.client
+                    .complete_multipart_upload()
+                    .bucket(&self.bucket)
+                    .key(key)
+                    .upload_id(upload_id)
+                    .multipart_upload(
+                        CompletedMultipartUpload::builder()
+                            .set_parts(Some(parts))
+                            .build(),
+                    )
+                    .send(),
+            )
+            .await?;
             tracing::info!(%key, size, parts = part_count, "multipart upload completed");
             Ok::<_, anyhow::Error>(())
-        }
-        .await;
+        };
+        let result = tokio::time::timeout(S3_UPLOAD_TIMEOUT, result)
+            .await
+            .context("multipart upload exceeded 5 minutes")
+            .and_then(|result| result);
         if result.is_err()
-            && let Err(error) = self
-                .client
-                .abort_multipart_upload()
-                .bucket(&self.bucket)
-                .key(key)
-                .upload_id(upload_id)
-                .send()
-                .await
+            && let Err(error) = await_s3(
+                "abort multipart upload",
+                self.client
+                    .abort_multipart_upload()
+                    .bucket(&self.bucket)
+                    .key(key)
+                    .upload_id(upload_id)
+                    .send(),
+            )
+            .await
         {
             tracing::warn!(%error, %key, "abort multipart upload failed");
         }
@@ -254,7 +275,6 @@ impl Archiver {
     }
 
     async fn upload_pending(&self) -> Result<()> {
-        let active_hour = self.writer.active_hour()?;
         for entry in walk_files(self.writer.directory())? {
             if entry.extension().and_then(|v| v.to_str()) != Some("duckdb") {
                 continue;
@@ -262,7 +282,8 @@ impl Archiver {
             let Some(hour) = hour_from_path(&entry) else {
                 continue;
             };
-            if is_uploadable(hour, active_hour) && !entry.with_extension("duckdb.uploaded").exists()
+            if self.writer.is_archive_ready(hour)?
+                && !entry.with_extension("duckdb.uploaded").exists()
             {
                 self.upload_with_retry(ClosedDatabase { hour, path: entry })
                     .await;
@@ -301,8 +322,17 @@ impl Archiver {
     }
 }
 
-fn is_uploadable(hour: DateTime<Utc>, active_hour: DateTime<Utc>) -> bool {
-    hour < active_hour
+async fn await_s3<T, E>(
+    label: &'static str,
+    future: impl Future<Output = Result<T, E>>,
+) -> Result<T>
+where
+    E: std::error::Error + Send + Sync + 'static,
+{
+    tokio::time::timeout(S3_REQUEST_TIMEOUT, future)
+        .await
+        .with_context(|| format!("S3 {label} timed out after 90 seconds"))?
+        .with_context(|| format!("S3 {label} failed"))
 }
 
 fn walk_files(root: &Path) -> Result<Vec<PathBuf>> {
@@ -341,17 +371,5 @@ mod tests {
             parsed.map(|value| value.to_rfc3339()),
             Some("2026-08-03T12:00:00+00:00".to_owned())
         );
-    }
-
-    #[test]
-    fn uploadability_follows_writer_hour_instead_of_wall_clock() -> Result<()> {
-        let active = DateTime::parse_from_rfc3339("2026-08-03T14:00:00Z")?.to_utc();
-        let closed = active - chrono::Duration::hours(1);
-        let future = active + chrono::Duration::hours(1);
-
-        assert!(is_uploadable(closed, active));
-        assert!(!is_uploadable(active, active));
-        assert!(!is_uploadable(future, active));
-        Ok(())
     }
 }

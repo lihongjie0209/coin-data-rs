@@ -1,7 +1,8 @@
 use std::{
+    collections::HashSet,
     path::{Path, PathBuf},
     sync::{
-        Arc,
+        Arc, RwLock,
         atomic::{AtomicI64, Ordering},
     },
     time::Duration,
@@ -37,6 +38,13 @@ pub struct Writer {
     directory: PathBuf,
     exchange: String,
     active_hour_timestamp: Arc<AtomicI64>,
+    checkpointing: Arc<RwLock<HashSet<PathBuf>>>,
+}
+
+struct RotationState {
+    checkpoint_sender: std::sync::mpsc::Sender<ClosedDatabase>,
+    active_hour_timestamp: Arc<AtomicI64>,
+    checkpointing: Arc<RwLock<HashSet<PathBuf>>>,
 }
 
 impl Writer {
@@ -59,19 +67,31 @@ impl Writer {
 
         let (sender, receiver) = mpsc::channel(capacity);
         let (closed_sender, closed_receiver) = mpsc::unbounded_channel();
+        let (checkpoint_sender, checkpoint_receiver) = std::sync::mpsc::channel();
         let active_hour_timestamp = Arc::new(AtomicI64::new(hour.timestamp()));
+        let checkpointing = Arc::new(RwLock::new(HashSet::new()));
+        let checkpointing_worker = Arc::clone(&checkpointing);
+        std::thread::Builder::new()
+            .name("duckdb-checkpoint".to_owned())
+            .spawn(move || {
+                checkpoint_run(checkpoint_receiver, closed_sender, &checkpointing_worker);
+            })
+            .context("start checkpoint worker")?;
         let run_directory = directory.clone();
         let run_metrics = Arc::clone(&metrics);
-        let run_active_hour_timestamp = Arc::clone(&active_hour_timestamp);
+        let rotation = RotationState {
+            checkpoint_sender,
+            active_hour_timestamp: Arc::clone(&active_hour_timestamp),
+            checkpointing: Arc::clone(&checkpointing),
+        };
         tokio::task::spawn_blocking(move || {
             if let Err(error) = run(
                 run_directory,
                 hour,
                 receiver,
-                closed_sender,
                 batch_size,
                 &run_metrics,
-                &run_active_hour_timestamp,
+                rotation,
             ) {
                 tracing::error!(error = %format!("{error:#}"), "database writer stopped");
             }
@@ -109,6 +129,7 @@ impl Writer {
                 directory,
                 exchange,
                 active_hour_timestamp,
+                checkpointing,
             },
             closed_receiver,
         ))
@@ -152,6 +173,21 @@ impl Writer {
             .context("invalid active database hour")
     }
 
+    pub fn is_archive_ready(&self, hour: DateTime<Utc>) -> Result<bool> {
+        if hour >= self.active_hour()? {
+            return Ok(false);
+        }
+        let path = self.database_path(hour);
+        if path.with_extension("duckdb.wal").exists() {
+            return Ok(false);
+        }
+        let checkpointing = self
+            .checkpointing
+            .read()
+            .map_err(|_| anyhow::anyhow!("checkpoint state lock poisoned"))?;
+        Ok(!checkpointing.contains(&path))
+    }
+
     fn observe_queue(&self) {
         let used = self
             .sender
@@ -165,10 +201,9 @@ fn run(
     directory: PathBuf,
     mut hour: DateTime<Utc>,
     mut receiver: mpsc::Receiver<Command>,
-    closed_sender: mpsc::UnboundedSender<ClosedDatabase>,
     batch_size: usize,
     metrics: &Metrics,
-    active_hour_timestamp: &AtomicI64,
+    rotation: RotationState,
 ) -> Result<()> {
     let mut storage = Storage::open_existing(&hourly_path(&directory, hour))?;
     let mut pending = Vec::with_capacity(batch_size);
@@ -186,12 +221,16 @@ fn run(
                     continue;
                 }
                 flush(&mut storage, &mut pending, batch_size, metrics)?;
-                storage.checkpoint()?;
                 drop(storage);
                 let closed = ClosedDatabase {
                     hour,
                     path: hourly_path(&directory, hour),
                 };
+                rotation
+                    .checkpointing
+                    .write()
+                    .map_err(|_| anyhow::anyhow!("checkpoint state lock poisoned"))?
+                    .insert(closed.path.clone());
                 prepare_database(&hourly_path(&directory, next_hour))?;
                 prepare_database(&hourly_path(
                     &directory,
@@ -199,8 +238,13 @@ fn run(
                 ))?;
                 storage = Storage::open_existing(&hourly_path(&directory, next_hour))?;
                 hour = next_hour;
-                active_hour_timestamp.store(hour.timestamp(), Ordering::Release);
-                let _ = closed_sender.send(closed);
+                rotation
+                    .active_hour_timestamp
+                    .store(hour.timestamp(), Ordering::Release);
+                rotation
+                    .checkpoint_sender
+                    .send(closed)
+                    .context("checkpoint worker stopped")?;
             }
             Command::Stats(response) => {
                 flush(&mut storage, &mut pending, batch_size, metrics)?;
@@ -221,6 +265,31 @@ fn run(
         }
     }
     flush(&mut storage, &mut pending, batch_size, metrics)
+}
+
+fn checkpoint_run(
+    receiver: std::sync::mpsc::Receiver<ClosedDatabase>,
+    closed_sender: mpsc::UnboundedSender<ClosedDatabase>,
+    checkpointing: &RwLock<HashSet<PathBuf>>,
+) {
+    while let Ok(closed) = receiver.recv() {
+        let result = Storage::open_existing(&closed.path).and_then(|storage| storage.checkpoint());
+        if let Ok(mut paths) = checkpointing.write() {
+            paths.remove(&closed.path);
+        }
+        match result {
+            Ok(()) => {
+                let _ = closed_sender.send(closed);
+            }
+            Err(error) => {
+                tracing::error!(
+                    path = %closed.path.display(),
+                    error = %format!("{error:#}"),
+                    "background checkpoint failed"
+                );
+            }
+        }
+    }
 }
 
 fn flush(
@@ -292,6 +361,8 @@ mod tests {
             .context("rotation notification missing")?;
         assert_eq!(item.hour, current);
         assert_eq!(writer.active_hour()?, next);
+        assert!(writer.is_archive_ready(current)?);
+        assert!(!writer.is_archive_ready(next)?);
         assert!(item.path.is_file());
         assert!(writer.database_path(next).is_file());
         assert!(
