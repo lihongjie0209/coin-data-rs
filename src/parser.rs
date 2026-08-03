@@ -101,44 +101,27 @@ fn parse_depth(data: &Value, received: DateTime<Utc>, source: &str) -> Result<Ve
     let symbol = string(data, "s");
     let first = uint(data, "U");
     let final_id = uint(data, "u");
-    let mut records = vec![record(
+    Ok(vec![record(
         "depth_updates",
         vec![
-            event_at.clone(),
+            event_at,
             timestamp(received),
             text(symbol),
-            first.clone(),
-            final_id.clone(),
+            first,
+            final_id,
             text(source),
+            json_array(data, "b")?,
+            json_array(data, "a")?,
         ],
-    )];
-    for (side, key) in [("bid", "b"), ("ask", "a")] {
-        for (index, level) in data
-            .get(key)
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .enumerate()
-        {
-            let values = level.as_array().context("depth level must be an array")?;
-            records.push(record(
-                "depth_levels",
-                vec![
-                    event_at.clone(),
-                    timestamp(received),
-                    text(symbol),
-                    first.clone(),
-                    final_id.clone(),
-                    text(side),
-                    DuckValue::Int((index + 1) as i32),
-                    text(values.first().and_then(Value::as_str).unwrap_or_default()),
-                    text(values.get(1).and_then(Value::as_str).unwrap_or_default()),
-                    text(source),
-                ],
-            ));
-        }
-    }
-    Ok(records)
+    )])
+}
+
+fn json_array(value: &Value, key: &str) -> Result<DuckValue> {
+    let array = value
+        .get(key)
+        .and_then(Value::as_array)
+        .map_or(&[][..], Vec::as_slice);
+    Ok(text(serde_json::to_string(array)?))
 }
 
 fn parse_ticker(data: &Value, received: DateTime<Utc>, source: &str) -> Record {
@@ -289,12 +272,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn depth_should_expand_levels_without_raw_event() -> Result<()> {
+    fn depth_should_store_levels_as_structured_arrays() -> Result<()> {
         let payload = br#"{"stream":"btcusdt@depth@100ms","data":{"e":"depthUpdate","E":1767225600000,"s":"BTCUSDT","U":1,"u":2,"b":[["100","1"]],"a":[["101","2"]]}}"#;
         let records = parse(payload, Utc::now(), "websocket")?;
-        assert_eq!(records.len(), 3);
+        assert_eq!(records.len(), 1);
         assert_eq!(records[0].table, "depth_updates");
-        assert_eq!(records[1].table, "depth_levels");
+        assert_eq!(records[0].values.len(), 8);
         Ok(())
     }
 }

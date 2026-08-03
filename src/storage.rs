@@ -25,6 +25,9 @@ impl Storage {
     pub fn open_existing(path: &Path) -> Result<Self> {
         let connection = Connection::open(path).context("open DuckDB")?;
         configure(&connection)?;
+        connection
+            .execute_batch(include_str!("schema.sql"))
+            .context("migrate schema")?;
         Ok(Self { connection })
     }
 

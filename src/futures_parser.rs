@@ -53,52 +53,30 @@ fn parse_depth(data: &Value, received: DateTime<Utc>, source: &str) -> Result<Ve
     let previous = uint(data, "pu");
     let symbol = string(data, "s");
     let pair = string(data, "ps");
-    let mut records = vec![Record {
+    Ok(vec![Record {
         table: "futures_depth_updates",
         values: vec![
-            event_time.clone(),
-            transaction_time.clone(),
+            event_time,
+            transaction_time,
             timestamp(received),
             text(symbol),
             text(pair),
-            first.clone(),
-            final_id.clone(),
-            previous.clone(),
+            first,
+            final_id,
+            previous,
             text(source),
+            json_array(data, "b")?,
+            json_array(data, "a")?,
         ],
-    }];
-    for (side, key) in [("bid", "b"), ("ask", "a")] {
-        for (index, level) in data
-            .get(key)
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .enumerate()
-        {
-            let values = level
-                .as_array()
-                .context("futures depth level must be array")?;
-            records.push(Record {
-                table: "futures_depth_levels",
-                values: vec![
-                    event_time.clone(),
-                    transaction_time.clone(),
-                    timestamp(received),
-                    text(symbol),
-                    text(pair),
-                    first.clone(),
-                    final_id.clone(),
-                    previous.clone(),
-                    text(side),
-                    DuckValue::Int(i32::try_from(index + 1).unwrap_or(i32::MAX)),
-                    decimal_value(values.first().and_then(Value::as_str).unwrap_or_default()),
-                    decimal_value(values.get(1).and_then(Value::as_str).unwrap_or_default()),
-                    text(source),
-                ],
-            });
-        }
-    }
-    Ok(records)
+    }])
+}
+
+fn json_array(value: &Value, key: &str) -> Result<DuckValue> {
+    let array = value
+        .get(key)
+        .and_then(Value::as_array)
+        .map_or(&[][..], Vec::as_slice);
+    Ok(text(serde_json::to_string(array)?))
 }
 
 fn aggregate_trade(data: &Value, received: DateTime<Utc>, source: &str) -> Record {
@@ -327,8 +305,9 @@ mod tests {
     fn futures_depth_should_preserve_previous_update_id() -> Result<()> {
         let payload = br#"{"stream":"btcusdt@depth@100ms","data":{"e":"depthUpdate","E":1785731400000,"T":1785731400001,"s":"BTCUSDT","U":10,"u":12,"pu":9,"b":[["100","1"]],"a":[["101","2"]]}}"#;
         let records = parse(payload, Utc::now(), "binance_usdm_websocket")?;
-        assert_eq!(records.len(), 3);
+        assert_eq!(records.len(), 1);
         assert_eq!(records[0].table, "futures_depth_updates");
+        assert_eq!(records[0].values.len(), 11);
         Ok(())
     }
 
