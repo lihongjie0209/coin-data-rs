@@ -290,7 +290,28 @@ fn run_maintenance(
         // DuckDB connections opened before an Appender commit can retain an old catalog/data
         // snapshot. Reopen for each low-frequency maintenance request so API queries, gap checks,
         // and cleanup observe the latest committed writer state without pausing ingestion.
-        let mut storage = Storage::open_existing(&database)?;
+        let mut storage = match open_maintenance_storage(&database) {
+            Ok(storage) => storage,
+            Err(error) => {
+                let detail = format!("{error:#}");
+                tracing::warn!(error = %detail, "database maintenance request failed to open");
+                match command {
+                    MaintenanceCommand::Stats(response) => {
+                        let _ = response.send(Err(anyhow::anyhow!(detail)));
+                    }
+                    MaintenanceCommand::Query { response, .. } => {
+                        let _ = response.send(Err(anyhow::anyhow!(detail)));
+                    }
+                    MaintenanceCommand::Upload { response, .. } => {
+                        let _ = response.send(Err(anyhow::anyhow!(detail)));
+                    }
+                    MaintenanceCommand::Cleanup { response, .. } => {
+                        let _ = response.send(Err(anyhow::anyhow!(detail)));
+                    }
+                }
+                continue;
+            }
+        };
         match command {
             MaintenanceCommand::Stats(response) => {
                 let _ = response.send(storage.stats());
@@ -311,4 +332,16 @@ fn run_maintenance(
         }
     }
     Ok(())
+}
+
+fn open_maintenance_storage(database: &std::path::Path) -> Result<Storage> {
+    let mut last_error = None;
+    for _ in 0..20 {
+        match Storage::open_existing(database) {
+            Ok(storage) => return Ok(storage),
+            Err(error) => last_error = Some(error),
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("open DuckDB failed")))
 }
