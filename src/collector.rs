@@ -3,6 +3,7 @@ use std::{sync::Arc, time::Duration};
 use anyhow::{Context, Result, bail};
 use chrono::Utc;
 use futures_util::{SinkExt, StreamExt};
+use tokio::sync::mpsc;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 use crate::{config::Market, futures_parser, parser, runtime::Metrics, writer::Writer};
@@ -44,7 +45,7 @@ async fn collect(
     id: usize,
     group: &'static str,
     writer: &Writer,
-    metrics: &Metrics,
+    metrics: &Arc<Metrics>,
     market: Market,
 ) -> Result<()> {
     let (socket, _) = connect_async(url)
@@ -62,6 +63,14 @@ async fn collect(
         streams = streams.len(),
         "websocket connected"
     );
+    let (payload_sender, payload_receiver) = mpsc::channel(2_048);
+    tokio::spawn(process_payloads(
+        payload_receiver,
+        writer.clone(),
+        Arc::clone(metrics),
+        market,
+        id,
+    ));
     let rotation = tokio::time::sleep(Duration::from_secs(23 * 60 * 60 + 50 * 60));
     tokio::pin!(rotation);
     loop {
@@ -82,14 +91,29 @@ async fn collect(
             Message::Close(_) => return Ok(()),
             _ => continue,
         };
+        let received = Utc::now();
         metrics
             .received_messages
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         metrics.last_message_unix_ms.store(
-            Utc::now().timestamp_millis().max(0) as u64,
+            received.timestamp_millis().max(0) as u64,
             std::sync::atomic::Ordering::Relaxed,
         );
-        let received = Utc::now();
+        payload_sender
+            .send((payload, received))
+            .await
+            .context("websocket processing pipeline stopped")?;
+    }
+}
+
+async fn process_payloads(
+    mut receiver: mpsc::Receiver<(Vec<u8>, chrono::DateTime<Utc>)>,
+    writer: Writer,
+    metrics: Arc<Metrics>,
+    market: Market,
+    shard_id: usize,
+) -> Result<()> {
+    while let Some((payload, received)) = receiver.recv().await {
         let parsed = if market == Market::Spot {
             parser::parse(&payload, received, "binance_spot_websocket")
         } else {
@@ -114,15 +138,16 @@ async fn collect(
                 if let Ok(control) = serde_json::from_slice::<serde_json::Value>(&payload)
                     && (control.get("result").is_some() || control.get("code").is_some())
                 {
-                    tracing::info!(shard = id, response = %control, "websocket control response");
+                    tracing::info!(shard = shard_id, response = %control, "websocket control response");
                 }
             }
             Err(error) => {
                 metrics
                     .parse_errors
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                tracing::warn!(shard = id, %error, "invalid websocket event");
+                tracing::warn!(shard = shard_id, %error, "invalid websocket event");
             }
         }
     }
+    Ok(())
 }
