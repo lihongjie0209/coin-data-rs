@@ -1,0 +1,25 @@
+[Unit]
+Description=Binance market data collector (Rust)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=coin-data
+Group=coin-data
+EnvironmentFile=-/etc/coin-data-rs.env
+Environment=RUST_LOG=coin_data=info
+Environment=LD_LIBRARY_PATH=/usr/local/lib/coin-data-rs
+ExecStart=/usr/local/bin/coin-data-rs --database /var/lib/coin-data-rs/market.duckdb --parquet-dir /var/lib/coin-data-rs/parquet --api-address 127.0.0.1:8081
+Restart=always
+RestartSec=5
+TimeoutStopSec=30
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/coin-data-rs
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
