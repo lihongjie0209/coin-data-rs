@@ -45,7 +45,7 @@ The SQL endpoint intentionally accepts arbitrary SQL and must remain private.
 Hourly DuckDB objects use exchange, date, and hour:
 
 ```text
-duckdb/rust/binance/2026-08-03/04.duckdb
+parquet/rust/binance/2026-08-03/04.duckdb
 ```
 
 The single file contains all spot, USD-M, and COIN-M tables for the hour. Market-specific `source`

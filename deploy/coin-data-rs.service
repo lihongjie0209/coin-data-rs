@@ -10,7 +10,7 @@ Group=coin-data
 EnvironmentFile=-/etc/coin-data-rs.env
 Environment=RUST_LOG=coin_data=info
 Environment=LD_LIBRARY_PATH=/usr/local/lib/coin-data-rs
-ExecStart=/usr/local/bin/coin-data-rs --exchange binance --database /var/lib/coin-data-rs/market.duckdb --api-address 127.0.0.1:8081 --s3-prefix duckdb/rust
+ExecStart=/usr/local/bin/coin-data-rs --exchange binance --database /var/lib/coin-data-rs/market.duckdb --api-address 127.0.0.1:8081 --s3-prefix parquet/rust
 Restart=always
 RestartSec=5
 TimeoutStopSec=30

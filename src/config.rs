@@ -89,7 +89,7 @@ pub struct Config {
     pub api_address: String,
     #[arg(long, default_value = "coin-data-196920285698-ap-southeast-1-an")]
     pub s3_bucket: String,
-    #[arg(long, default_value = "duckdb/rust")]
+    #[arg(long, default_value = "parquet/rust")]
     pub s3_prefix: String,
     #[arg(long, default_value = "ap-southeast-1")]
     pub aws_region: String,
