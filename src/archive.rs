@@ -11,7 +11,7 @@ use aws_sdk_s3::{
     primitives::{ByteStream, Length},
     types::{CompletedMultipartUpload, CompletedPart},
 };
-use chrono::{DateTime, Datelike, Timelike, Utc};
+use chrono::{DateTime, Datelike, NaiveDateTime, Timelike, Utc};
 use futures_util::{StreamExt, TryStreamExt, stream};
 use tokio::sync::mpsc;
 
@@ -320,7 +320,21 @@ fn walk_files(root: &Path) -> Result<Vec<PathBuf>> {
 fn hour_from_path(path: &Path) -> Option<DateTime<Utc>> {
     let day = path.parent()?.file_name()?.to_str()?;
     let hour = path.file_stem()?.to_str()?;
-    DateTime::parse_from_str(&format!("{day} {hour} +0000"), "%Y-%m-%d %H %z")
+    NaiveDateTime::parse_from_str(&format!("{day} {hour}:00:00"), "%Y-%m-%d %H:%M:%S")
         .ok()
-        .map(|v| v.with_timezone(&Utc))
+        .map(|value| value.and_utc())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_hourly_database_path() {
+        let parsed = hour_from_path(Path::new("/data/binance/2026-08-03/12.duckdb"));
+        assert_eq!(
+            parsed.map(|value| value.to_rfc3339()),
+            Some("2026-08-03T12:00:00+00:00".to_owned())
+        );
+    }
 }
