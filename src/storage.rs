@@ -131,8 +131,10 @@ impl Storage {
             );
             self.connection.execute(&sql, params![start, end])?;
             for symbol in symbols {
+                let partition_symbol =
+                    url::form_urlencoded::byte_serialize(symbol.as_bytes()).collect::<String>();
                 let staged_path = staging_directory
-                    .join(format!("symbol={symbol}"))
+                    .join(format!("symbol={partition_symbol}"))
                     .join(format!("date={}", start.format("%Y-%m-%d")))
                     .join(format!("hour={}", start.format("%H")))
                     .join("data_0.parquet");
@@ -289,7 +291,7 @@ mod tests {
             .context("invalid test time")?;
         let mut storage = Storage::open(&database)?;
         let mut records = Vec::new();
-        for symbol in ["BTCUSDT", "ETHUSDT"] {
+        for symbol in ["BTCUSDT", "ETHUSDT", "币安人生USDT"] {
             let payload = format!(
                 r#"{{"stream":"{}@aggTrade","data":{{"e":"aggTrade","E":1785731400000,"s":"{symbol}","a":1,"p":"1","q":"2","f":1,"l":1,"T":1785731400000,"m":false,"M":true}}}}"#,
                 symbol.to_ascii_lowercase()
@@ -301,8 +303,8 @@ mod tests {
         let files =
             storage.export_hour(start, start + chrono::Duration::hours(1), &parquet, false)?;
 
-        assert_eq!(files.len(), 2);
-        for symbol in ["BTCUSDT", "ETHUSDT"] {
+        assert_eq!(files.len(), 3);
+        for symbol in ["BTCUSDT", "ETHUSDT", "币安人生USDT"] {
             let path = parquet
                 .join(symbol)
                 .join("aggregate_trades")
