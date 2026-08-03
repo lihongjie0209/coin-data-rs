@@ -1,8 +1,8 @@
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
-use duckdb::{Connection, params, params_from_iter, types::ValueRef};
+use duckdb::{Connection, appender_params_from_iter, params, types::ValueRef};
 
 use crate::model::Record;
 
@@ -27,16 +27,13 @@ impl Storage {
         if records.is_empty() {
             return Ok(0);
         }
-        let transaction = self.connection.transaction().context("begin write batch")?;
         for table in TABLES {
-            let mut statement = transaction.prepare(insert_sql(table)?)?;
+            let mut appender = self.connection.appender(table)?;
             for record in records.iter().filter(|record| record.table == *table) {
-                statement
-                    .execute(params_from_iter(record.values.iter()))
-                    .with_context(|| format!("insert {}", record.table))?;
+                appender.append_row(appender_params_from_iter(record.values.iter()))?;
             }
+            appender.flush().with_context(|| format!("flush {table}"))?;
         }
-        transaction.commit().context("commit write batch")?;
         Ok(records.len())
     }
 
@@ -155,38 +152,3 @@ pub const TABLES: &[&str] = &[
     "klines",
     "average_prices",
 ];
-
-fn insert_sql(table: &str) -> Result<&'static str> {
-    let sql = match table {
-        "depth_updates" => "INSERT INTO depth_updates VALUES (?, ?, ?, ?, ?, ?)",
-        "depth_levels" => {
-            "INSERT INTO depth_levels VALUES (?, ?, ?, ?, ?, ?, ?, ?::DECIMAL(38,18), ?::DECIMAL(38,18), ?)"
-        }
-        "aggregate_trades" => {
-            "INSERT INTO aggregate_trades VALUES (?, ?, ?, ?, ?::DECIMAL(38,18), ?::DECIMAL(38,18), ?, ?, ?, ?, ?, ?)"
-        }
-        "trades" => {
-            "INSERT INTO trades VALUES (?, ?, ?, ?, ?::DECIMAL(38,18), ?::DECIMAL(38,18), ?, ?, ?, ?)"
-        }
-        "book_tickers" => {
-            "INSERT INTO book_tickers VALUES (?, ?, ?, ?::DECIMAL(38,18), ?::DECIMAL(38,18), ?::DECIMAL(38,18), ?::DECIMAL(38,18), ?)"
-        }
-        "tickers" => {
-            "INSERT INTO tickers VALUES (?, ?, ?, ?::DECIMAL(38,18), ?::DECIMAL(38,18), ?::DECIMAL(38,18), ?::DECIMAL(38,18), ?::DECIMAL(38,18), ?::DECIMAL(38,18), ?::DECIMAL(38,18), ?::DECIMAL(38,18), ?::DECIMAL(38,18), ?::DECIMAL(38,18), ?::DECIMAL(38,18), ?::DECIMAL(38,18), ?::DECIMAL(38,18), ?::DECIMAL(38,18), ?::DECIMAL(38,18), ?, ?, ?, ?, ?, ?)"
-        }
-        "rolling_tickers" => {
-            "INSERT INTO rolling_tickers VALUES (?, ?, ?, ?, ?::DECIMAL(38,18), ?::DECIMAL(38,18), ?::DECIMAL(38,18), ?::DECIMAL(38,18), ?::DECIMAL(38,18), ?::DECIMAL(38,18), ?::DECIMAL(38,18), ?::DECIMAL(38,18), ?::DECIMAL(38,18), ?, ?, ?, ?, ?, ?)"
-        }
-        "mini_tickers" => {
-            "INSERT INTO mini_tickers VALUES (?, ?, ?, ?::DECIMAL(38,18), ?::DECIMAL(38,18), ?::DECIMAL(38,18), ?::DECIMAL(38,18), ?::DECIMAL(38,18), ?::DECIMAL(38,18), ?)"
-        }
-        "klines" => {
-            "INSERT INTO klines VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?::DECIMAL(38,18), ?::DECIMAL(38,18), ?::DECIMAL(38,18), ?::DECIMAL(38,18), ?::DECIMAL(38,18), ?, ?, ?::DECIMAL(38,18), ?::DECIMAL(38,18), ?::DECIMAL(38,18), ?::DECIMAL(38,18), ?)"
-        }
-        "average_prices" => {
-            "INSERT INTO average_prices VALUES (?, ?, ?, ?, ?::DECIMAL(38,18), ?, ?)"
-        }
-        _ => bail!("unknown table {table}"),
-    };
-    Ok(sql)
-}

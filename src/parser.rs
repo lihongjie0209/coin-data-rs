@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use chrono::{DateTime, TimeZone, Utc};
-use duckdb::types::Value as DuckValue;
+use duckdb::types::{Decimal, Value as DuckValue};
 use serde_json::Value;
 
 use crate::model::{Record, text, timestamp};
@@ -258,7 +258,24 @@ fn string<'a>(value: &'a Value, key: &str) -> &'a str {
     value.get(key).and_then(Value::as_str).unwrap_or_default()
 }
 fn decimal(value: &Value, key: &str) -> DuckValue {
-    text(string(value, key))
+    let raw = string(value, key);
+    let (negative, unsigned) = raw
+        .strip_prefix('-')
+        .map_or((false, raw), |value| (true, value));
+    let (whole, fraction) = unsigned.split_once('.').unwrap_or((unsigned, ""));
+    let mut digits = String::with_capacity(whole.len() + 18);
+    digits.push_str(if whole.is_empty() { "0" } else { whole });
+    digits.extend(fraction.chars().take(18));
+    digits.extend(std::iter::repeat_n(
+        '0',
+        18usize.saturating_sub(fraction.len()),
+    ));
+    let scaled = digits
+        .parse::<i128>()
+        .ok()
+        .map(|value| if negative { -value } else { value })
+        .unwrap_or_default();
+    Decimal::new(38, 18, scaled).map_or(DuckValue::Null, DuckValue::Decimal)
 }
 fn uint(value: &Value, key: &str) -> DuckValue {
     DuckValue::UBigInt(value.get(key).and_then(Value::as_u64).unwrap_or_default())
