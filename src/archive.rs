@@ -12,6 +12,7 @@ use aws_sdk_s3::{
     types::{CompletedMultipartUpload, CompletedPart},
 };
 use chrono::{DateTime, Datelike, Timelike, Utc};
+use futures_util::{StreamExt, TryStreamExt, stream};
 use tokio::sync::mpsc;
 
 use crate::{
@@ -177,37 +178,50 @@ impl Archiver {
         let upload_id = created
             .upload_id()
             .context("S3 omitted multipart upload ID")?;
+        tracing::info!(%key, size, part_size = PART_SIZE, "multipart upload started");
         let result = async {
-            let mut parts = Vec::new();
-            let mut offset = 0;
-            let mut part_number = 1;
-            while offset < size {
-                let length = PART_SIZE.min(size - offset);
-                let body = ByteStream::read_from()
-                    .path(path)
-                    .offset(offset)
-                    .length(Length::Exact(length))
-                    .build()
-                    .await?;
-                let uploaded = self
-                    .client
-                    .upload_part()
-                    .bucket(&self.bucket)
-                    .key(key)
-                    .upload_id(upload_id)
-                    .part_number(part_number)
-                    .body(body)
-                    .send()
-                    .await?;
-                parts.push(
-                    CompletedPart::builder()
+            let chunks = (0..size.div_ceil(PART_SIZE))
+                .map(|index| {
+                    let offset = index * PART_SIZE;
+                    (
+                        i32::try_from(index + 1),
+                        offset,
+                        PART_SIZE.min(size - offset),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let mut parts = stream::iter(chunks)
+                .map(|(part_number, offset, length)| async move {
+                    let part_number = part_number?;
+                    let body = ByteStream::read_from()
+                        .path(path)
+                        .offset(offset)
+                        .length(Length::Exact(length))
+                        .build()
+                        .await?;
+                    let uploaded = self
+                        .client
+                        .upload_part()
+                        .bucket(&self.bucket)
+                        .key(key)
+                        .upload_id(upload_id)
                         .part_number(part_number)
-                        .set_e_tag(uploaded.e_tag().map(str::to_owned))
-                        .build(),
-                );
-                offset += length;
-                part_number += 1;
-            }
+                        .body(body)
+                        .send()
+                        .await?;
+                    tracing::debug!(%key, part_number, "multipart part uploaded");
+                    Ok::<_, anyhow::Error>(
+                        CompletedPart::builder()
+                            .part_number(part_number)
+                            .set_e_tag(uploaded.e_tag().map(str::to_owned))
+                            .build(),
+                    )
+                })
+                .buffer_unordered(2)
+                .try_collect::<Vec<_>>()
+                .await?;
+            parts.sort_unstable_by_key(|part| part.part_number());
+            let part_count = parts.len();
             self.client
                 .complete_multipart_upload()
                 .bucket(&self.bucket)
@@ -220,6 +234,7 @@ impl Archiver {
                 )
                 .send()
                 .await?;
+            tracing::info!(%key, size, parts = part_count, "multipart upload completed");
             Ok::<_, anyhow::Error>(())
         }
         .await;
