@@ -28,11 +28,13 @@ impl Storage {
             return Ok(0);
         }
         let transaction = self.connection.transaction().context("begin write batch")?;
-        for record in records {
-            let sql = insert_sql(record.table)?;
-            transaction
-                .execute(sql, params_from_iter(record.values.iter()))
-                .with_context(|| format!("insert {}", record.table))?;
+        for table in TABLES {
+            let mut statement = transaction.prepare(insert_sql(table)?)?;
+            for record in records.iter().filter(|record| record.table == *table) {
+                statement
+                    .execute(params_from_iter(record.values.iter()))
+                    .with_context(|| format!("insert {}", record.table))?;
+            }
         }
         transaction.commit().context("commit write batch")?;
         Ok(records.len())
@@ -58,12 +60,14 @@ impl Storage {
 
     pub fn query_json(&self, sql: &str) -> Result<serde_json::Value> {
         let mut statement = self.connection.prepare(sql).context("prepare SQL")?;
-        let names = statement.column_names();
-        if names.is_empty() {
-            let changed = statement.execute([]).context("execute SQL")?;
-            return Ok(serde_json::json!({"rows_changed": changed}));
-        }
         let mut rows = statement.query([]).context("query SQL")?;
+        let names = rows
+            .as_ref()
+            .map(duckdb::Statement::column_names)
+            .unwrap_or_default();
+        if names.is_empty() {
+            return Ok(serde_json::json!({"rows": []}));
+        }
         let mut result = Vec::new();
         while let Some(row) = rows.next().context("read SQL row")? {
             let mut object = serde_json::Map::with_capacity(names.len());
