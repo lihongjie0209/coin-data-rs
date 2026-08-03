@@ -1,4 +1,8 @@
-use std::{path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    path::PathBuf,
+    sync::{Arc, Condvar, Mutex},
+    time::Duration,
+};
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -14,7 +18,19 @@ pub enum Command {
     Records(Vec<Record>),
     Flush,
     Barrier(oneshot::Sender<Result<()>>),
+    SnapshotBarrier {
+        ready: oneshot::Sender<()>,
+        resume: Arc<(Mutex<bool>, Condvar)>,
+    },
     Shutdown(oneshot::Sender<Result<()>>),
+}
+
+struct SnapshotResumeGuard(Arc<(Mutex<bool>, Condvar)>);
+
+impl Drop for SnapshotResumeGuard {
+    fn drop(&mut self) {
+        resume_snapshot_writer(&self.0);
+    }
 }
 
 enum MaintenanceCommand {
@@ -123,16 +139,73 @@ impl Writer {
         directory: PathBuf,
         force: bool,
     ) -> Result<Vec<ExportFile>> {
-        let (response, result) = oneshot::channel();
-        self.sender.send(Command::Barrier(response)).await?;
-        result.await.context("database writer dropped barrier")??;
         let database = self.database.clone();
-        tokio::task::spawn_blocking(move || {
-            let mut storage = Storage::open_existing(&database)?;
-            storage.export_hour(start, end, &directory, force)
-        })
-        .await
-        .context("Parquet export task failed")?
+        let (connection_ready_tx, connection_ready_rx) = oneshot::channel();
+        let (begin_snapshot_tx, begin_snapshot_rx) = std::sync::mpsc::sync_channel(0);
+        let (snapshot_started_tx, snapshot_started_rx) = oneshot::channel();
+        let export_task = tokio::task::spawn_blocking(move || {
+            let mut storage = match Storage::open_existing(&database) {
+                Ok(storage) => {
+                    let _ = connection_ready_tx.send(Ok(()));
+                    storage
+                }
+                Err(error) => {
+                    let detail = format!("{error:#}");
+                    let _ = connection_ready_tx.send(Err(detail));
+                    return Err(error);
+                }
+            };
+            begin_snapshot_rx
+                .recv()
+                .context("snapshot start signal dropped")?;
+            if let Err(error) = storage.begin_snapshot() {
+                let detail = format!("{error:#}");
+                let _ = snapshot_started_tx.send(Err(detail));
+                return Err(error);
+            }
+            let _ = snapshot_started_tx.send(Ok(()));
+
+            match storage.export_hour(start, end, &directory, force) {
+                Ok(files) => {
+                    storage.finish_snapshot(true)?;
+                    Ok(files)
+                }
+                Err(error) => {
+                    let _ = storage.finish_snapshot(false);
+                    Err(error)
+                }
+            }
+        });
+
+        connection_ready_rx
+            .await
+            .context("Parquet export task stopped while opening DuckDB")?
+            .map_err(anyhow::Error::msg)?;
+
+        let (writer_ready_tx, writer_ready_rx) = oneshot::channel();
+        let resume_writer = Arc::new((Mutex::new(false), Condvar::new()));
+        self.sender
+            .send(Command::SnapshotBarrier {
+                ready: writer_ready_tx,
+                resume: Arc::clone(&resume_writer),
+            })
+            .await
+            .map_err(|_| anyhow::anyhow!("database writer stopped"))?;
+        writer_ready_rx
+            .await
+            .context("database writer dropped snapshot barrier")?;
+        let resume_guard = SnapshotResumeGuard(resume_writer);
+
+        if begin_snapshot_tx.send(()).is_err() {
+            return export_task.await.context("Parquet export task failed")?;
+        }
+        let snapshot_result = snapshot_started_rx.await;
+        drop(resume_guard);
+        snapshot_result
+            .context("Parquet export task stopped while starting snapshot")?
+            .map_err(anyhow::Error::msg)?;
+
+        export_task.await.context("Parquet export task failed")?
     }
 
     pub async fn record_uploads(&self, uploads: Vec<UploadRecord>) -> Result<()> {
@@ -210,6 +283,16 @@ fn handle(command: Command) -> Result<bool> {
         Command::Barrier(response) => {
             let _ = response.send(Ok(()));
         }
+        Command::SnapshotBarrier { ready, resume } => {
+            let _ = ready.send(());
+            let (lock, condition) = &*resume;
+            let mut resumed = lock.lock().unwrap_or_else(|error| error.into_inner());
+            while !*resumed {
+                resumed = condition
+                    .wait(resumed)
+                    .unwrap_or_else(|error| error.into_inner());
+            }
+        }
         Command::Shutdown(response) => {
             let _ = response.send(Ok(()));
             return Ok(true);
@@ -218,6 +301,13 @@ fn handle(command: Command) -> Result<bool> {
         Command::Records(_) => {}
     }
     Ok(false)
+}
+
+fn resume_snapshot_writer(resume: &Arc<(Mutex<bool>, Condvar)>) {
+    let (lock, condition) = &**resume;
+    let mut resumed = lock.lock().unwrap_or_else(|error| error.into_inner());
+    *resumed = true;
+    condition.notify_one();
 }
 
 fn run_maintenance(

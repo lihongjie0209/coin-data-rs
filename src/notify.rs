@@ -71,7 +71,8 @@ impl TelegramNotifier {
             human_bytes(disk_total),
         );
         if let Some(error) = report.error {
-            text.push_str(&format!("\nerror: {error:#}"));
+            let detail = format!("{error:#}").chars().take(1_000).collect::<String>();
+            text.push_str(&format!("\nerror: {detail}"));
         }
         self.client
             .post(endpoint)

@@ -50,6 +50,18 @@ impl Storage {
         Ok(Self { connection })
     }
 
+    pub fn begin_snapshot(&self) -> Result<()> {
+        self.connection
+            .execute_batch("BEGIN TRANSACTION")
+            .context("begin DuckDB export snapshot")
+    }
+
+    pub fn finish_snapshot(&self, commit: bool) -> Result<()> {
+        self.connection
+            .execute_batch(if commit { "COMMIT" } else { "ROLLBACK" })
+            .context("finish DuckDB export snapshot")
+    }
+
     pub fn insert(&mut self, records: &[Record]) -> Result<usize> {
         if records.is_empty() {
             return Ok(0);
