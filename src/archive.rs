@@ -122,12 +122,6 @@ impl Archiver {
         );
         let result = async {
             self.upload_object(&item.path, &key).await?;
-            self.client
-                .head_object()
-                .bucket(&self.bucket)
-                .key(&key)
-                .send()
-                .await?;
             std::fs::write(&marker, format!("{key}\n")).context("write upload marker")?;
             self.cleanup()?;
             Ok::<_, anyhow::Error>(())

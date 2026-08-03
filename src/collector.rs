@@ -24,11 +24,15 @@ pub async fn run_shard(
                 .reconnects
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
+        let started = std::time::Instant::now();
         match collect(&base_url, &streams, id, group, &writer, &metrics, market).await {
             Ok(()) => tracing::warn!(shard = id, group, "websocket closed"),
             Err(error) => tracing::warn!(shard = id, group, %error, "websocket disconnected"),
         }
         connected_once = true;
+        if started.elapsed() >= Duration::from_secs(5 * 60) {
+            delay = Duration::from_secs(1);
+        }
         tokio::time::sleep(delay).await;
         delay = (delay * 2).min(Duration::from_secs(30));
     }
@@ -68,6 +72,13 @@ async fn collect(
         let payload = match message {
             Message::Text(text) => text.as_bytes().to_vec(),
             Message::Binary(bytes) => bytes.to_vec(),
+            Message::Ping(payload) => {
+                outgoing
+                    .send(Message::Pong(payload))
+                    .await
+                    .context("reply websocket pong")?;
+                continue;
+            }
             Message::Close(_) => return Ok(()),
             _ => continue,
         };
