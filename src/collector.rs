@@ -5,16 +5,14 @@ use chrono::Utc;
 use futures_util::{SinkExt, StreamExt};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
-use crate::{
-    config::Market, futures_parser, parser, runtime::Metrics, stream_writer::StreamWriter,
-};
+use crate::{config::Market, futures_parser, parser, runtime::Metrics, writer::Writer};
 
 pub async fn run_shard(
     id: usize,
     group: &'static str,
     base_url: String,
     streams: Vec<String>,
-    writer: StreamWriter,
+    writer: Writer,
     metrics: Arc<Metrics>,
     market: Market,
 ) {
@@ -41,7 +39,7 @@ async fn collect(
     streams: &[String],
     id: usize,
     group: &'static str,
-    writer: &StreamWriter,
+    writer: &Writer,
     metrics: &Metrics,
     market: Market,
 ) -> Result<()> {

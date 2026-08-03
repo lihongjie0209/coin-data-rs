@@ -4,13 +4,14 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use coin_data_rs::{
     api::{ApiState, DatasetState, router},
+    archive::Archiver,
+    backfill::Backfiller,
     collector,
     config::Config,
     futures_poll::OpenInterestPoller,
     notify::TelegramNotifier,
     runtime::Metrics,
-    stream_writer::StreamWriter,
-    uploader::{Uploader, UploaderConfig},
+    writer::Writer,
 };
 use tokio::net::TcpListener;
 use tracing_subscriber::EnvFilter;
@@ -54,36 +55,29 @@ async fn start_dataset(config: Config) -> Result<DatasetState> {
         "symbol universe resolved"
     );
     let metrics = Arc::new(Metrics::default());
-    let directory = config.dataset_parquet_dir();
+    let writer = Writer::start(
+        config.database.clone(),
+        config.queue_capacity,
+        config.batch_size,
+        config.flush_interval(),
+        Arc::clone(&metrics),
+    )?;
+    let backfiller = if config.exchange == coin_data_rs::config::Exchange::Binance {
+        let backfiller = Backfiller::new(
+            config.rest_url(),
+            symbols.clone(),
+            writer.clone(),
+            config.market,
+        );
+        backfiller.clone().spawn();
+        Some(backfiller)
+    } else {
+        None
+    };
     let notifier = TelegramNotifier::from_env(
         Arc::clone(&metrics),
         format!("{}/{}", config.exchange.as_str(), config.market.as_str()),
     );
-    let uploader = Uploader::start(UploaderConfig {
-        directory: directory.clone(),
-        bucket: config.s3_bucket.clone(),
-        prefix: config.dataset_s3_prefix(),
-        region: config.aws_region.clone(),
-        min_retention_hours: config.min_retention_hours,
-        max_retention_hours: config.max_retention_hours,
-        min_free_disk_percent: config.min_free_disk_percent,
-        notifier,
-    })
-    .await;
-    let writer = StreamWriter::start(
-        directory.clone(),
-        config.queue_capacity,
-        Arc::clone(&metrics),
-        uploader.clone(),
-    );
-    coin_data_rs::backfill::Backfiller::new(
-        config.rest_url(),
-        symbols.clone(),
-        writer.clone(),
-        config.market,
-        directory.clone(),
-    )
-    .spawn();
     if config.exchange == coin_data_rs::config::Exchange::Binance
         && config.market != coin_data_rs::config::Market::Spot
     {
@@ -95,6 +89,9 @@ async fn start_dataset(config: Config) -> Result<DatasetState> {
         )
         .spawn();
     }
+    let archiver = Arc::new(Archiver::new(&config, writer.clone(), backfiller, notifier).await);
+    Arc::clone(&archiver).spawn_hourly();
+
     let mut shard_id = 0;
     let groups = config.stream_groups();
     let connection_counts = config.connection_counts(symbols.len());
@@ -116,8 +113,7 @@ async fn start_dataset(config: Config) -> Result<DatasetState> {
     Ok(DatasetState {
         writer,
         metrics,
-        uploader,
-        directory,
+        archiver,
     })
 }
 

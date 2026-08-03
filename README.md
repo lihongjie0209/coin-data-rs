@@ -1,25 +1,23 @@
 # coin-data-rs
 
-Rust implementation of a Binance Spot, USDⓈ-M, and COIN-M real-time market-data collector. One process supervises all three markets. It consumes sharded WebSocket streams and writes every documented field directly to structured Parquet parts.
+Rust implementation of a Binance Spot, USDⓈ-M, and COIN-M real-time market-data collector. One process supervises all three markets while each market retains an independent DuckDB file. It consumes sharded WebSocket streams, stores documented fields in structured tables, exports hourly Parquet files, and uploads them to S3.
 
 DuckDB is dynamically linked. Release archives contain the matching `libduckdb.so`; install it under `/usr/local/lib/coin-data-rs` (the systemd unit sets `LD_LIBRARY_PATH`). The server does not need GCC or a Rust toolchain.
 
-The receiver and Parquet writers are separated by bounded asynchronous channels. Four dedicated
-blocking writer shards keep WebSocket ingestion responsive and cap the total pending record buffer
-at 64 MiB. Completed local parts are streamed into larger Parquet objects and uploaded by a separate
-background worker every 30 minutes; merging does not load a full partition into memory. DuckDB is
-used only by the private SQL endpoint to query immutable local Parquet files.
+The receiver and database writer are separated by a bounded asynchronous channel. DuckDB writes run
+on a dedicated blocking thread. Export uses a checkpointed snapshot so live ingestion resumes while
+Parquet files are generated and uploaded.
 
 ## Run
 
 ```bash
 cargo run --release -- \
-  --parquet-dir data/parquet
+  --database data/market.duckdb
 ```
 
-Use `--help` for all settings. By default the process runs `spot`, `usdm`, and `coinm` together under independent dataset directories. Set `--all-markets=false --market usdm` to run one market only. The default `--symbols ALL` discovers all currently tradable instruments in each market. The desired connection count defaults to four per market and is automatically increased when Binance's 1024-stream limit requires it. USDⓈ-M high-frequency public streams and regular market streams are routed to their separate endpoints.
+Use `--help` for all settings. By default the process runs `spot`, `usdm`, and `coinm` together and creates `binance-spot.duckdb`, `binance-usdm.duckdb`, and `binance-coinm.duckdb` next to the `--database` path. Set `--all-markets=false --market usdm` to run one market only. The default `--symbols ALL` discovers all currently tradable instruments in each market. The desired connection count defaults to four per market and is automatically increased when Binance's 1024-stream limit requires it. USDⓈ-M high-frequency public streams and regular market streams are routed to their separate endpoints.
 
-Aggregate-trade gaps are checked every ten minutes, with a check at minute 29 and 59 before each upload. Spot uses `/api/v3/aggTrades`; futures use their corresponding `/fapi` or `/dapi` endpoint. Futures open interest is sampled once per minute.
+Aggregate-trade gaps are checked every ten minutes and immediately before export. Spot uses `/api/v3/aggTrades`; futures use their corresponding `/fapi` or `/dapi` endpoint. Futures open interest is sampled once per minute.
 
 Local structured data is normally retained for at most eight hours. When free disk falls below 20%, uploaded rows older than four hours are reclaimed; data inside the four-hour safety window is never pressure-deleted. All three thresholds are configurable.
 
@@ -40,18 +38,17 @@ curl -X POST http://127.0.0.1:8081/v1/archive \
 
 The SQL endpoint intentionally accepts arbitrary SQL and must remain private.
 
-S3 objects use exchange, market, symbol, table, date, and hour. Each populated partition normally
-gets `data-00.parquet` and `data-30.parquet`:
+Hourly Parquet objects use exchange, market, symbol, table, date, and hour:
 
 ```text
-parquet/rust/binance/usdm/BTCUSDT/futures_aggregate_trades/2026-08-03/04/data-30.parquet
+parquet/rust/binance/usdm/BTCUSDT/futures_aggregate_trades/2026-08-03/04/data.parquet
 ```
 
 Only table/symbol/hour partitions containing rows produce files. Every source field, including
 `symbol`, remains present in each Parquet file.
 
 Set `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` to receive a success or failure report after every
-automatic or manually triggered upload. Reports include merged/source file counts, bytes, duration, collector
+automatic or manually triggered archive. Reports include file count, bytes, duration, collector
 counters, load average, memory, and disk usage.
 
 ## Tables

@@ -4,7 +4,7 @@ use anyhow::Result;
 use chrono::Utc;
 use futures_util::{StreamExt, stream};
 
-use crate::{config::Market, futures_parser, stream_writer::StreamWriter};
+use crate::{config::Market, futures_parser, writer::Writer};
 
 #[derive(Clone)]
 pub struct OpenInterestPoller {
@@ -12,16 +12,11 @@ pub struct OpenInterestPoller {
     rest_url: String,
     symbols: Vec<String>,
     market: Market,
-    writer: StreamWriter,
+    writer: Writer,
 }
 
 impl OpenInterestPoller {
-    pub fn new(
-        rest_url: String,
-        symbols: Vec<String>,
-        market: Market,
-        writer: StreamWriter,
-    ) -> Self {
+    pub fn new(rest_url: String, symbols: Vec<String>, market: Market, writer: Writer) -> Self {
         Self {
             client: reqwest::Client::new(),
             rest_url,
