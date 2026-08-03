@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use chrono::Utc;
 use serde_json::Value;
 
-use crate::{parser, writer::Writer};
+use crate::{config::Market, futures_parser, parser, writer::Writer};
 
 #[derive(Clone)]
 pub struct Backfiller {
@@ -10,15 +10,17 @@ pub struct Backfiller {
     rest_url: String,
     symbols: Vec<String>,
     writer: Writer,
+    market: Market,
 }
 
 impl Backfiller {
-    pub fn new(rest_url: String, symbols: Vec<String>, writer: Writer) -> Self {
+    pub fn new(rest_url: String, symbols: Vec<String>, writer: Writer, market: Market) -> Self {
         Self {
             client: reqwest::Client::new(),
             rest_url,
             symbols,
             writer,
+            market,
         }
     }
 
@@ -48,8 +50,13 @@ impl Backfiller {
 
     async fn backfill_symbol(&self, symbol: &str) -> Result<usize> {
         let escaped = symbol.replace('\'', "''");
+        let table = if self.market == Market::Spot {
+            "aggregate_trades"
+        } else {
+            "futures_aggregate_trades"
+        };
         let sql = format!(
-            "WITH ids AS (SELECT DISTINCT aggregate_trade_id id FROM aggregate_trades WHERE symbol='{escaped}' AND event_time >= now()-INTERVAL '9 hours'), gaps AS (SELECT lag(id) OVER (ORDER BY id) previous_id,id FROM ids) SELECT previous_id+1 first_id,id-1 last_id FROM gaps WHERE id>previous_id+1 ORDER BY id LIMIT 100"
+            "WITH ids AS (SELECT DISTINCT aggregate_trade_id id FROM {table} WHERE symbol='{escaped}' AND event_time >= now()-INTERVAL '9 hours'), gaps AS (SELECT lag(id) OVER (ORDER BY id) previous_id,id FROM ids) SELECT previous_id+1 first_id,id-1 last_id FROM gaps WHERE id>previous_id+1 ORDER BY id LIMIT 100"
         );
         let response = self.writer.query(sql).await?;
         let gaps = response
@@ -74,12 +81,14 @@ impl Backfiller {
                     ("fromId", next.to_string()),
                     ("limit", limit.to_string()),
                 ];
+                let endpoint = match self.market {
+                    Market::Spot => "/api/v3/aggTrades",
+                    Market::Usdm => "/fapi/v1/aggTrades",
+                    Market::Coinm => "/dapi/v1/aggTrades",
+                };
                 let values: Vec<Value> = self
                     .client
-                    .get(format!(
-                        "{}/api/v3/aggTrades",
-                        self.rest_url.trim_end_matches('/')
-                    ))
+                    .get(format!("{}{endpoint}", self.rest_url.trim_end_matches('/')))
                     .query(&query)
                     .send()
                     .await?
@@ -92,7 +101,21 @@ impl Backfiller {
                 let received = Utc::now();
                 let records = values
                     .iter()
-                    .map(|value| parser::parse_rest_aggregate_trade(symbol, value, received))
+                    .map(|value| match self.market {
+                        Market::Spot => parser::parse_rest_aggregate_trade(symbol, value, received),
+                        Market::Usdm => futures_parser::parse_rest_aggregate_trade(
+                            symbol,
+                            value,
+                            received,
+                            "binance_usdm_rest_backfill",
+                        ),
+                        Market::Coinm => futures_parser::parse_rest_aggregate_trade(
+                            symbol,
+                            value,
+                            received,
+                            "binance_coinm_rest_backfill",
+                        ),
+                    })
                     .collect::<Vec<_>>();
                 next = values
                     .last()

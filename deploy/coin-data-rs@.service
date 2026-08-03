@@ -1,5 +1,5 @@
 [Unit]
-Description=Binance market data collector (Rust)
+Description=Binance market data collector (%i)
 After=network-online.target
 Wants=network-online.target
 
@@ -8,9 +8,10 @@ Type=simple
 User=coin-data
 Group=coin-data
 EnvironmentFile=-/etc/coin-data-rs.env
+EnvironmentFile=/etc/coin-data-rs/%i.env
 Environment=RUST_LOG=coin_data=info
 Environment=LD_LIBRARY_PATH=/usr/local/lib/coin-data-rs
-ExecStart=/usr/local/bin/coin-data-rs --exchange binance --market spot --database /var/lib/coin-data-rs/binance-spot.duckdb --parquet-dir /var/lib/coin-data-rs/parquet --api-address 127.0.0.1:8081 --s3-prefix parquet/rust
+ExecStart=/usr/local/bin/coin-data-rs --exchange binance --market ${MARKET} --database ${DATABASE} --parquet-dir /var/lib/coin-data-rs/parquet --api-address ${API_ADDRESS} --s3-prefix parquet/rust --archive-minute ${ARCHIVE_MINUTE}
 Restart=always
 RestartSec=5
 TimeoutStopSec=30

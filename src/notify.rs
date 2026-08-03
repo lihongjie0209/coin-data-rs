@@ -11,6 +11,7 @@ pub struct TelegramNotifier {
     endpoint: Option<String>,
     chat_id: Option<String>,
     metrics: Arc<Metrics>,
+    dataset: String,
 }
 
 pub struct ArchiveNotification<'a> {
@@ -24,7 +25,7 @@ pub struct ArchiveNotification<'a> {
 }
 
 impl TelegramNotifier {
-    pub fn from_env(metrics: Arc<Metrics>) -> Self {
+    pub fn from_env(metrics: Arc<Metrics>, dataset: String) -> Self {
         let token = std::env::var("TELEGRAM_BOT_TOKEN").ok();
         let chat_id = std::env::var("TELEGRAM_CHAT_ID").ok();
         let endpoint =
@@ -34,6 +35,7 @@ impl TelegramNotifier {
             endpoint,
             chat_id,
             metrics,
+            dataset,
         }
     }
 
@@ -50,8 +52,9 @@ impl TelegramNotifier {
         let disk_total = fs2::total_space(report.data_directory).unwrap_or_default();
         let disk_available = fs2::available_space(report.data_directory).unwrap_or_default();
         let mut text = format!(
-            "Parquet {}\nhour: {}\nfiles: {}\ndata: {}\nelapsed: {:.1}s\nrecords: received={} parsed={} written={} dropped={} errors={} reconnects={}\nwriter queue: current={} peak={}\nlast message: {}\nload1: {load}\nmemory: {} / {}\ndisk: {} free / {}",
+            "Parquet {}\ndataset: {}\nhour: {}\nfiles: {}\ndata: {}\nelapsed: {:.1}s\nrecords: received={} parsed={} written={} dropped={} errors={} reconnects={}\nwriter queue: current={} peak={}\nlast message: {}\nload1: {load}\nmemory: {} / {}\ndisk: {} free / {}",
             report.status,
+            self.dataset,
             report.hour,
             report.files,
             human_bytes(report.bytes),

@@ -286,8 +286,11 @@ fn run_maintenance(
     database: PathBuf,
     mut receiver: mpsc::Receiver<MaintenanceCommand>,
 ) -> Result<()> {
-    let mut storage = Storage::open_existing(&database)?;
     while let Some(command) = receiver.blocking_recv() {
+        // DuckDB connections opened before an Appender commit can retain an old catalog/data
+        // snapshot. Reopen for each low-frequency maintenance request so API queries, gap checks,
+        // and cleanup observe the latest committed writer state without pausing ingestion.
+        let mut storage = Storage::open_existing(&database)?;
         match command {
             MaintenanceCommand::Stats(response) => {
                 let _ = response.send(storage.stats());

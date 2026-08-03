@@ -3,6 +3,8 @@ pub mod archive;
 pub mod backfill;
 pub mod collector;
 pub mod config;
+pub mod futures_parser;
+pub mod futures_poll;
 pub mod model;
 pub mod notify;
 pub mod parser;

@@ -81,7 +81,7 @@ impl Storage {
             tables.insert((*table).to_owned(), count.into());
         }
         let symbols: i64 = self.connection.query_row(
-            "SELECT count(DISTINCT symbol) FROM depth_updates",
+            "SELECT count(DISTINCT symbol) FROM (SELECT symbol FROM depth_updates UNION ALL SELECT symbol FROM futures_depth_updates)",
             [],
             |row| row.get(0),
         )?;
@@ -255,10 +255,10 @@ impl Storage {
 }
 
 fn time_column(table: &str) -> &'static str {
-    if table == "book_tickers" {
-        "received_at"
-    } else {
-        "event_time"
+    match table {
+        "book_tickers" => "received_at",
+        "futures_open_interest" => "observed_at",
+        _ => "event_time",
     }
 }
 
@@ -292,6 +292,16 @@ pub const TABLES: &[&str] = &[
     "mini_tickers",
     "klines",
     "average_prices",
+    "futures_depth_updates",
+    "futures_depth_levels",
+    "futures_aggregate_trades",
+    "futures_book_tickers",
+    "futures_mark_prices",
+    "futures_liquidations",
+    "futures_open_interest",
+    "futures_mini_tickers",
+    "futures_tickers",
+    "futures_klines",
 ];
 
 #[cfg(test)]

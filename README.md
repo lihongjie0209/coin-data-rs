@@ -1,21 +1,24 @@
 # coin-data-rs
 
-Rust implementation of a Binance Spot real-time market-data collector. It consumes sharded combined WebSocket streams, stores every documented field in structured DuckDB tables, exports hourly Parquet files, and uploads them to S3.
+Rust implementation of a Binance Spot, USDⓈ-M, and COIN-M real-time market-data collector. Each market runs as an independent process and DuckDB file. It consumes sharded WebSocket streams, stores documented fields in structured tables, exports hourly Parquet files, and uploads them to S3.
 
 DuckDB is dynamically linked. Release archives contain the matching `libduckdb.so`; install it under `/usr/local/lib/coin-data-rs` (the systemd unit sets `LD_LIBRARY_PATH`). The server does not need GCC or a Rust toolchain.
 
 The receiver and database writer are separated by a bounded asynchronous channel. DuckDB writes run
-on a dedicated blocking thread. An export first crosses an ordered flush barrier, then uses a separate
-DuckDB connection so live writes continue while Parquet files are generated and uploaded.
+on a dedicated blocking thread. Export uses a checkpointed snapshot so live ingestion resumes while
+Parquet files are generated and uploaded.
 
 ## Run
 
 ```bash
 cargo run --release -- \
-  --database data/market.duckdb
+  --market usdm \
+  --database data/binance-usdm.duckdb
 ```
 
-Use `--help` for all settings. The default `--symbols ALL` discovers every currently tradable Binance Spot pair from `exchangeInfo`. `--ws-connections 0` automatically uses at least `ceil(symbols × streams / 1024)` connections; an explicitly larger value is also accepted. Subscriptions are sent after the WebSocket handshake, avoiding combined-stream URL length limits.
+Use `--help` for all settings. `--market` accepts `spot`, `usdm`, or `coinm`. The default `--symbols ALL` discovers all currently tradable instruments in that market. The desired connection count defaults to four and is automatically increased when Binance's 1024-stream limit requires it. USDⓈ-M high-frequency public streams and regular market streams are routed to their separate endpoints.
+
+Aggregate-trade gaps are checked every ten minutes and immediately before export. Spot uses `/api/v3/aggTrades`; futures use their corresponding `/fapi` or `/dapi` endpoint. Futures open interest is sampled once per minute.
 
 Local structured data is normally retained for at most eight hours. When free disk falls below 20%, uploaded rows older than four hours are reclaimed; data inside the four-hour safety window is never pressure-deleted. All three thresholds are configurable.
 
@@ -36,10 +39,10 @@ curl -X POST http://127.0.0.1:8081/v1/archive \
 
 The SQL endpoint intentionally accepts arbitrary SQL and must remain private.
 
-Hourly Parquet objects are partitioned by table and symbol:
+Hourly Parquet objects use exchange, market, symbol, table, date, and hour:
 
 ```text
-parquet/rust/BTCUSDT/aggregate_trades/2026-08-03/04/data.parquet
+parquet/rust/binance/usdm/BTCUSDT/futures_aggregate_trades/2026-08-03/04/data.parquet
 ```
 
 Only table/symbol/hour partitions containing rows produce files. Every source field, including
@@ -51,4 +54,4 @@ counters, load average, memory, and disk usage.
 
 ## Tables
 
-`depth_updates`, `depth_levels`, `aggregate_trades`, `trades`, `book_tickers`, `tickers`, `rolling_tickers`, `mini_tickers`, `klines`, and `average_prices`. Raw JSON is not retained.
+Spot tables include `depth_updates`, `depth_levels`, `aggregate_trades`, `trades`, `book_tickers`, `tickers`, `rolling_tickers`, `mini_tickers`, `klines`, and `average_prices`. Futures use dedicated `futures_*` tables for depth, aggregate trades, book ticker, mark/index/funding price, liquidation, open interest, mini ticker, ticker, and kline data. Raw JSON is not retained.

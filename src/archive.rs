@@ -21,19 +21,20 @@ pub struct Archiver {
     bucket: String,
     prefix: String,
     directory: PathBuf,
-    backfiller: Backfiller,
+    backfiller: Option<Backfiller>,
     min_retention_hours: u64,
     max_retention_hours: u64,
     min_free_disk_percent: u64,
     notifier: TelegramNotifier,
     export_lock: Arc<tokio::sync::Mutex<()>>,
+    archive_minute: u32,
 }
 
 impl Archiver {
     pub async fn new(
         config: &Config,
         writer: Writer,
-        backfiller: Backfiller,
+        backfiller: Option<Backfiller>,
         notifier: TelegramNotifier,
     ) -> Self {
         let sdk = aws_config::defaults(BehaviorVersion::latest())
@@ -44,14 +45,15 @@ impl Archiver {
             writer,
             client: Client::new(&sdk),
             bucket: config.s3_bucket.clone(),
-            prefix: config.s3_prefix.trim_matches('/').to_owned(),
-            directory: config.parquet_dir.clone(),
+            prefix: config.dataset_s3_prefix(),
+            directory: config.dataset_parquet_dir(),
             backfiller,
             min_retention_hours: config.min_retention_hours,
             max_retention_hours: config.max_retention_hours,
             min_free_disk_percent: config.min_free_disk_percent,
             notifier,
             export_lock: Arc::new(tokio::sync::Mutex::new(())),
+            archive_minute: config.archive_minute(),
         }
     }
 
@@ -84,7 +86,9 @@ impl Archiver {
     async fn export_inner(&self, start: DateTime<Utc>, force: bool) -> Result<ArchiveReport> {
         std::fs::create_dir_all(&self.directory).context("create parquet directory")?;
         self.cleanup().await?;
-        self.backfiller.run().await.context("pre-export backfill")?;
+        if let Some(backfiller) = &self.backfiller {
+            backfiller.run().await.context("pre-export backfill")?;
+        }
         let start = start
             .with_minute(0)
             .and_then(|value| value.with_second(0))
@@ -181,15 +185,25 @@ impl Archiver {
             loop {
                 let now = Utc::now();
                 let next = now
-                    .with_minute(0)
+                    .with_minute(self.archive_minute)
                     .and_then(|value| value.with_second(0))
                     .and_then(|value| value.with_nanosecond(0))
-                    .map(|value| value + chrono::Duration::hours(1));
+                    .map(|value| {
+                        if value <= now {
+                            value + chrono::Duration::hours(1)
+                        } else {
+                            value
+                        }
+                    });
                 let Some(next) = next else { return };
                 let wait =
                     (next - now).to_std().unwrap_or_default() + std::time::Duration::from_secs(5);
                 tokio::time::sleep(wait).await;
-                let hour = next - chrono::Duration::hours(1);
+                let hour = (next - chrono::Duration::hours(1))
+                    .with_minute(0)
+                    .and_then(|value| value.with_second(0))
+                    .and_then(|value| value.with_nanosecond(0));
+                let Some(hour) = hour else { continue };
                 if let Err(error) = self.export(hour, false).await {
                     tracing::error!(%error, %hour, "hourly archive failed");
                 }
