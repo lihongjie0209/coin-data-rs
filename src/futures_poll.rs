@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use chrono::Utc;
 use futures_util::{StreamExt, stream};
 
@@ -69,10 +69,12 @@ impl OpenInterestPoller {
         let received = Utc::now();
         let mut records = Vec::with_capacity(self.symbols.len());
         while let Some(result) = requests.next().await {
-            let (symbol, value) = result.context("fetch open interest")?;
-            records.push(futures_parser::parse_open_interest(
-                &symbol, &value, received, source,
-            ));
+            match result {
+                Ok((symbol, value)) => records.push(futures_parser::parse_open_interest(
+                    &symbol, &value, received, source,
+                )),
+                Err(error) => tracing::warn!(%error, "fetch open interest for symbol failed"),
+            }
         }
         let count = records.len();
         self.writer.records(records).await?;

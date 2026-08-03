@@ -1,9 +1,9 @@
-use std::sync::Arc;
+use std::{collections::BTreeMap, sync::Arc};
 
 use anyhow::{Context, Result};
 use clap::Parser;
 use coin_data_rs::{
-    api::{ApiState, router},
+    api::{ApiState, DatasetState, router},
     archive::Archiver,
     backfill::Backfiller,
     collector,
@@ -24,7 +24,27 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    let config = Config::parse();
+    let root_config = Config::parse();
+    let mut datasets = BTreeMap::new();
+    for config in root_config.dataset_configs() {
+        let name = config.market.as_str().to_owned();
+        let state = start_dataset(config).await?;
+        datasets.insert(name, state);
+    }
+    let state = ApiState {
+        datasets: Arc::new(datasets),
+    };
+    let listener = TcpListener::bind(&root_config.api_address)
+        .await
+        .with_context(|| format!("bind API on {}", root_config.api_address))?;
+    tracing::info!(address = %root_config.api_address, "API listening");
+    axum::serve(listener, router(state))
+        .with_graceful_shutdown(shutdown())
+        .await
+        .context("serve API")
+}
+
+async fn start_dataset(config: Config) -> Result<DatasetState> {
     let symbols = config.resolve_symbols().await?;
     config.validate(&symbols)?;
     tracing::info!(
@@ -90,19 +110,11 @@ async fn main() -> Result<()> {
         }
     }
 
-    let state = ApiState {
+    Ok(DatasetState {
         writer,
         metrics,
         archiver,
-    };
-    let listener = TcpListener::bind(&config.api_address)
-        .await
-        .with_context(|| format!("bind API on {}", config.api_address))?;
-    tracing::info!(address = %config.api_address, "API listening");
-    axum::serve(listener, router(state))
-        .with_graceful_shutdown(shutdown())
-        .await
-        .context("serve API")
+    })
 }
 
 async fn shutdown() {

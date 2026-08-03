@@ -1,6 +1,6 @@
 # coin-data-rs
 
-Rust implementation of a Binance Spot, USDⓈ-M, and COIN-M real-time market-data collector. Each market runs as an independent process and DuckDB file. It consumes sharded WebSocket streams, stores documented fields in structured tables, exports hourly Parquet files, and uploads them to S3.
+Rust implementation of a Binance Spot, USDⓈ-M, and COIN-M real-time market-data collector. One process supervises all three markets while each market retains an independent DuckDB file. It consumes sharded WebSocket streams, stores documented fields in structured tables, exports hourly Parquet files, and uploads them to S3.
 
 DuckDB is dynamically linked. Release archives contain the matching `libduckdb.so`; install it under `/usr/local/lib/coin-data-rs` (the systemd unit sets `LD_LIBRARY_PATH`). The server does not need GCC or a Rust toolchain.
 
@@ -12,11 +12,10 @@ Parquet files are generated and uploaded.
 
 ```bash
 cargo run --release -- \
-  --market usdm \
-  --database data/binance-usdm.duckdb
+  --database data/market.duckdb
 ```
 
-Use `--help` for all settings. `--market` accepts `spot`, `usdm`, or `coinm`. The default `--symbols ALL` discovers all currently tradable instruments in that market. The desired connection count defaults to four and is automatically increased when Binance's 1024-stream limit requires it. USDⓈ-M high-frequency public streams and regular market streams are routed to their separate endpoints.
+Use `--help` for all settings. By default the process runs `spot`, `usdm`, and `coinm` together and creates `binance-spot.duckdb`, `binance-usdm.duckdb`, and `binance-coinm.duckdb` next to the `--database` path. Set `--all-markets=false --market usdm` to run one market only. The default `--symbols ALL` discovers all currently tradable instruments in each market. The desired connection count defaults to four per market and is automatically increased when Binance's 1024-stream limit requires it. USDⓈ-M high-frequency public streams and regular market streams are routed to their separate endpoints.
 
 Aggregate-trade gaps are checked every ten minutes and immediately before export. Spot uses `/api/v3/aggTrades`; futures use their corresponding `/fapi` or `/dapi` endpoint. Futures open interest is sampled once per minute.
 
@@ -31,10 +30,10 @@ curl http://127.0.0.1:8081/healthz
 curl http://127.0.0.1:8081/v1/stats
 curl -X POST http://127.0.0.1:8081/v1/sql \
   -H 'content-type: application/json' \
-  -d '{"sql":"select symbol,count(*) from aggregate_trades group by symbol"}'
+  -d '{"market":"usdm","sql":"select symbol,count(*) from futures_aggregate_trades group by symbol"}'
 curl -X POST http://127.0.0.1:8081/v1/archive \
   -H 'content-type: application/json' \
-  -d '{"hour":"2026-08-03T12:00:00Z","force":true}'
+  -d '{"market":"coinm","hour":"2026-08-03T12:00:00Z","force":true}'
 ```
 
 The SQL endpoint intentionally accepts arbitrary SQL and must remain private.

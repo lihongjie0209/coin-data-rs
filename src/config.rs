@@ -64,6 +64,13 @@ pub struct Config {
     pub exchange: Exchange,
     #[arg(long, value_enum, default_value_t = Market::Spot)]
     pub market: Market,
+    #[arg(
+        long,
+        default_value_t = true,
+        action = clap::ArgAction::Set,
+        help = "run spot, USD-M, and COIN-M together; set false for --market only"
+    )]
+    pub all_markets: bool,
     #[arg(long, default_value = DEFAULT_SYMBOLS)]
     symbols: String,
     #[arg(long)]
@@ -107,6 +114,34 @@ pub struct Config {
 }
 
 impl Config {
+    pub fn dataset_configs(&self) -> Vec<Self> {
+        let markets: &[Market] = if self.all_markets {
+            &[Market::Spot, Market::Usdm, Market::Coinm]
+        } else {
+            std::slice::from_ref(&self.market)
+        };
+        markets
+            .iter()
+            .map(|market| {
+                let mut config = self.clone();
+                config.market = *market;
+                config.all_markets = false;
+                if self.all_markets {
+                    let parent = self
+                        .database
+                        .parent()
+                        .unwrap_or_else(|| std::path::Path::new("."));
+                    config.database = parent.join(format!(
+                        "{}-{}.duckdb",
+                        self.exchange.as_str(),
+                        market.as_str()
+                    ));
+                    config.archive_minute = None;
+                }
+                config
+            })
+            .collect()
+    }
     pub fn validate(&self, symbols: &[String]) -> Result<()> {
         if self.exchange != Exchange::Binance {
             bail!("only Binance is enabled in this release");
@@ -140,13 +175,23 @@ impl Config {
         if configured.len() != 1 || configured[0] != "ALL" {
             return Ok(configured);
         }
-        let response: serde_json::Value = reqwest::Client::new()
-            .get(self.instrument_url())
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await?;
+        let client = reqwest::Client::new();
+        let url = self.instrument_url();
+        let mut delay = Duration::from_secs(1);
+        let response = loop {
+            match client.get(&url).send().await {
+                Ok(response) => match response.error_for_status() {
+                    Ok(response) => match response.json::<serde_json::Value>().await {
+                        Ok(value) => break value,
+                        Err(error) => tracing::warn!(%error, %url, "decode exchangeInfo failed"),
+                    },
+                    Err(error) => tracing::warn!(%error, %url, "exchangeInfo rejected"),
+                },
+                Err(error) => tracing::warn!(%error, %url, "fetch exchangeInfo failed"),
+            }
+            tokio::time::sleep(delay).await;
+            delay = (delay * 2).min(Duration::from_secs(30));
+        };
         let list = match (self.exchange, self.market) {
             (Exchange::Binance, _) => response.get("symbols"),
             (Exchange::Okx, _) => response.get("data"),
@@ -165,7 +210,8 @@ impl Config {
                             == Some(true)
                 }
                 (Exchange::Binance, Market::Usdm | Market::Coinm) => {
-                    item.get("contractStatus")
+                    item.get("status")
+                        .or_else(|| item.get("contractStatus"))
                         .and_then(serde_json::Value::as_str)
                         == Some("TRADING")
                 }

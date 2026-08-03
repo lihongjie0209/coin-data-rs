@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{collections::BTreeMap, sync::Arc};
 
 use axum::{
     Json, Router,
@@ -15,6 +15,11 @@ use crate::{archive::Archiver, runtime::Metrics, writer::Writer};
 
 #[derive(Clone)]
 pub struct ApiState {
+    pub datasets: Arc<BTreeMap<String, DatasetState>>,
+}
+
+#[derive(Clone)]
+pub struct DatasetState {
     pub writer: Writer,
     pub metrics: Arc<Metrics>,
     pub archiver: Arc<Archiver>,
@@ -29,31 +34,50 @@ pub fn router(state: ApiState) -> Router {
         .with_state(state)
 }
 
-async fn health() -> Json<Value> {
-    Json(json!({"status": "ok"}))
+async fn health(State(state): State<ApiState>) -> Json<Value> {
+    Json(json!({"status": "ok", "datasets": state.datasets.keys().collect::<Vec<_>>()}))
 }
 
 async fn stats(State(state): State<ApiState>) -> Result<Json<Value>, ApiError> {
-    Ok(Json(json!({
-        "runtime": state.metrics.snapshot(),
-        "database": state.writer.stats().await?,
-    })))
+    let mut result = serde_json::Map::new();
+    for (name, dataset) in state.datasets.iter() {
+        result.insert(
+            name.clone(),
+            json!({
+                "runtime": dataset.metrics.snapshot(),
+                "database": dataset.writer.stats().await?,
+            }),
+        );
+    }
+    Ok(Json(Value::Object(result)))
 }
 
 #[derive(Deserialize)]
 struct SQLRequest {
+    #[serde(default = "default_market")]
+    market: String,
     sql: String,
+}
+
+fn default_market() -> String {
+    "spot".to_owned()
 }
 
 async fn sql(
     State(state): State<ApiState>,
     Json(request): Json<SQLRequest>,
 ) -> Result<Json<Value>, ApiError> {
-    Ok(Json(state.writer.query(request.sql).await?))
+    let dataset = state
+        .datasets
+        .get(&request.market)
+        .ok_or_else(|| anyhow::anyhow!("unknown market {}", request.market))?;
+    Ok(Json(dataset.writer.query(request.sql).await?))
 }
 
 #[derive(Deserialize)]
 struct ArchiveRequest {
+    #[serde(default = "default_market")]
+    market: String,
     hour: DateTime<Utc>,
     #[serde(default)]
     force: bool,
@@ -63,7 +87,11 @@ async fn archive(
     State(state): State<ApiState>,
     Json(request): Json<ArchiveRequest>,
 ) -> Result<Json<Value>, ApiError> {
-    let keys = state.archiver.export(request.hour, request.force).await?;
+    let dataset = state
+        .datasets
+        .get(&request.market)
+        .ok_or_else(|| anyhow::anyhow!("unknown market {}", request.market))?;
+    let keys = dataset.archiver.export(request.hour, request.force).await?;
     Ok(Json(json!({"uploaded": keys})))
 }
 
