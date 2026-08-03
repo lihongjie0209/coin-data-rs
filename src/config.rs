@@ -93,9 +93,9 @@ pub struct Config {
     pub s3_prefix: String,
     #[arg(long, default_value = "ap-southeast-1")]
     pub aws_region: String,
-    #[arg(long, default_value_t = 4)]
+    #[arg(long, default_value_t = 2)]
     pub min_retention_hours: u64,
-    #[arg(long, default_value_t = 8)]
+    #[arg(long, default_value_t = 2)]
     pub max_retention_hours: u64,
     #[arg(long, default_value_t = 20)]
     pub min_free_disk_percent: u64,
@@ -130,8 +130,8 @@ impl Config {
             .ok_or_else(|| anyhow::anyhow!("batch size must be positive"))?;
         NonZeroUsize::new(self.queue_capacity)
             .ok_or_else(|| anyhow::anyhow!("queue capacity must be positive"))?;
-        if self.min_retention_hours < 4 || self.max_retention_hours < self.min_retention_hours {
-            bail!("retention must keep at least 4 hours and max must be >= min");
+        if self.min_retention_hours == 0 || self.max_retention_hours < self.min_retention_hours {
+            bail!("retention must keep at least 1 hour and max must be >= min");
         }
         if self.min_free_disk_percent > 100 {
             bail!("minimum free disk percent must be <= 100");

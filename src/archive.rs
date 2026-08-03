@@ -291,7 +291,7 @@ impl Archiver {
                 continue;
             };
             let marker = path.with_extension("duckdb.uploaded");
-            if hour < cutoff && marker.exists() {
+            if hour <= cutoff && marker.exists() {
                 std::fs::remove_file(&path)?;
                 std::fs::remove_file(marker)?;
             }

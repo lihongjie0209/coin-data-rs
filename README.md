@@ -23,7 +23,7 @@ Aggregate trades come only from real-time WebSocket streams; REST historical bac
 Futures open interest is sampled once per minute and shares a global Binance REST backoff after
 HTTP 418 or 429 responses.
 
-Uploaded hourly DuckDB files are normally retained locally for at most eight hours. When free disk falls below 20%, uploaded files older than four hours are deleted early; active, future, unuploaded, and files inside the four-hour safety window are never pressure-deleted. All three thresholds are configurable.
+Uploaded hourly DuckDB files are retained locally for the current and previous hour by default. Only files with a successful upload marker are removed; active, future, and unuploaded files are never deleted. The retention and free-disk thresholds are configurable.
 
 ## API
 
