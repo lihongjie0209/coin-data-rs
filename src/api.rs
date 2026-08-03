@@ -39,17 +39,16 @@ async fn health(State(state): State<ApiState>) -> Json<Value> {
 }
 
 async fn stats(State(state): State<ApiState>) -> Result<Json<Value>, ApiError> {
-    let mut result = serde_json::Map::new();
-    for (name, dataset) in state.datasets.iter() {
-        result.insert(
-            name.clone(),
-            json!({
-                "runtime": dataset.metrics.snapshot(),
-                "database": dataset.writer.stats().await?,
-            }),
-        );
-    }
-    Ok(Json(Value::Object(result)))
+    let dataset = state
+        .datasets
+        .values()
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("no active dataset"))?;
+    Ok(Json(json!({
+        "markets": state.datasets.keys().collect::<Vec<_>>(),
+        "runtime": dataset.metrics.snapshot(),
+        "database": dataset.writer.stats().await?,
+    })))
 }
 
 #[derive(Deserialize)]
