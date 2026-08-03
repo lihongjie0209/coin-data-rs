@@ -23,7 +23,13 @@ async fn main() -> Result<()> {
         .init();
 
     let config = Config::parse();
-    config.validate()?;
+    let symbols = config.resolve_symbols().await?;
+    config.validate(&symbols)?;
+    tracing::info!(
+        symbols = symbols.len(),
+        connections = config.connection_count(symbols.len()),
+        "symbol universe resolved"
+    );
     let metrics = Arc::new(Metrics::default());
     let writer = Writer::start(
         config.database.clone(),
@@ -32,12 +38,12 @@ async fn main() -> Result<()> {
         config.flush_interval(),
         Arc::clone(&metrics),
     );
-    let backfiller = Backfiller::new(config.rest_url.clone(), config.symbols(), writer.clone());
+    let backfiller = Backfiller::new(config.rest_url.clone(), symbols.clone(), writer.clone());
     backfiller.clone().spawn();
     let archiver = Arc::new(Archiver::new(&config, writer.clone(), backfiller).await);
     Arc::clone(&archiver).spawn_hourly();
 
-    for (id, streams) in config.shards().into_iter().enumerate() {
+    for (id, streams) in config.shards(&symbols).into_iter().enumerate() {
         tokio::spawn(collector::run_shard(
             id,
             config.ws_url.clone(),

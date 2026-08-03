@@ -22,6 +22,20 @@ pub enum Command {
         response: oneshot::Sender<Result<Vec<PathBuf>>>,
     },
     Flush,
+    Upload {
+        table: String,
+        start: DateTime<Utc>,
+        bucket: String,
+        key: String,
+        etag: String,
+        size: u64,
+        response: oneshot::Sender<Result<()>>,
+    },
+    Cleanup {
+        cutoff: DateTime<Utc>,
+        bucket: String,
+        response: oneshot::Sender<Result<usize>>,
+    },
     Shutdown(oneshot::Sender<Result<()>>),
 }
 
@@ -96,6 +110,42 @@ impl Writer {
             .await?;
         result.await.context("database writer dropped response")?
     }
+
+    pub async fn record_upload(
+        &self,
+        table: String,
+        start: DateTime<Utc>,
+        bucket: String,
+        key: String,
+        etag: String,
+        size: u64,
+    ) -> Result<()> {
+        let (response, result) = oneshot::channel();
+        self.sender
+            .send(Command::Upload {
+                table,
+                start,
+                bucket,
+                key,
+                etag,
+                size,
+                response,
+            })
+            .await?;
+        result.await.context("database writer dropped response")?
+    }
+
+    pub async fn cleanup(&self, cutoff: DateTime<Utc>, bucket: String) -> Result<usize> {
+        let (response, result) = oneshot::channel();
+        self.sender
+            .send(Command::Cleanup {
+                cutoff,
+                bucket,
+                response,
+            })
+            .await?;
+        result.await.context("database writer dropped response")?
+    }
 }
 
 fn run(
@@ -157,6 +207,24 @@ fn handle(storage: &mut Storage, command: Command) -> Result<bool> {
             return Ok(true);
         }
         Command::Flush => {}
+        Command::Upload {
+            table,
+            start,
+            bucket,
+            key,
+            etag,
+            size,
+            response,
+        } => {
+            let _ = response.send(storage.record_upload(&table, start, &bucket, &key, &etag, size));
+        }
+        Command::Cleanup {
+            cutoff,
+            bucket,
+            response,
+        } => {
+            let _ = response.send(storage.cleanup(cutoff, &bucket));
+        }
         Command::Records(_) => {}
     }
     Ok(false)

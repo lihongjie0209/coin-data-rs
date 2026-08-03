@@ -2,7 +2,7 @@ use std::{sync::Arc, time::Duration};
 
 use anyhow::{Context, Result, bail};
 use chrono::Utc;
-use futures_util::StreamExt;
+use futures_util::{SinkExt, StreamExt};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 use crate::{parser, runtime::Metrics, writer::Writer};
@@ -14,7 +14,6 @@ pub async fn run_shard(
     writer: Writer,
     metrics: Arc<Metrics>,
 ) {
-    let url = format!("{base_url}?streams={}", streams.join("/"));
     let mut delay = Duration::from_secs(1);
     let mut connected_once = false;
     loop {
@@ -23,7 +22,7 @@ pub async fn run_shard(
                 .reconnects
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
-        match collect(&url, id, &writer, &metrics).await {
+        match collect(&base_url, &streams, id, &writer, &metrics).await {
             Ok(()) => tracing::warn!(shard = id, "websocket closed"),
             Err(error) => tracing::warn!(shard = id, %error, "websocket disconnected"),
         }
@@ -33,12 +32,23 @@ pub async fn run_shard(
     }
 }
 
-async fn collect(url: &str, id: usize, writer: &Writer, metrics: &Metrics) -> Result<()> {
+async fn collect(
+    url: &str,
+    streams: &[String],
+    id: usize,
+    writer: &Writer,
+    metrics: &Metrics,
+) -> Result<()> {
     let (socket, _) = connect_async(url)
         .await
         .context("connect Binance websocket")?;
+    let (mut outgoing, mut incoming) = socket.split();
+    let request = serde_json::json!({"method": "SUBSCRIBE", "params": streams, "id": 1});
+    outgoing
+        .send(Message::Text(request.to_string().into()))
+        .await
+        .context("subscribe Binance streams")?;
     tracing::info!(shard = id, "websocket connected");
-    let (_, mut incoming) = socket.split();
     let rotation = tokio::time::sleep(Duration::from_secs(23 * 60 * 60 + 50 * 60));
     tokio::pin!(rotation);
     loop {

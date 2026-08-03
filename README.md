@@ -10,12 +10,12 @@ The receiver and database writer are separated by a bounded asynchronous channel
 
 ```bash
 cargo run --release -- \
-  --symbols BTCUSDT,ETHUSDT \
-  --ws-connections 4 \
   --database data/market.duckdb
 ```
 
-Use `--help` for all settings. Defaults collect ten liquid USDT pairs with four WebSocket connections and eleven stream types per symbol.
+Use `--help` for all settings. The default `--symbols ALL` discovers every currently tradable Binance Spot pair from `exchangeInfo`. `--ws-connections 0` automatically uses at least `ceil(symbols × streams / 1024)` connections; an explicitly larger value is also accepted. Subscriptions are sent after the WebSocket handshake, avoiding combined-stream URL length limits.
+
+Local structured data is normally retained for at most eight hours. When free disk falls below 20%, uploaded rows older than four hours are reclaimed; data inside the four-hour safety window is never pressure-deleted. All three thresholds are configurable.
 
 ## API
 

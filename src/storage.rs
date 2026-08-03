@@ -119,6 +119,40 @@ impl Storage {
         }
         Ok(files)
     }
+
+    pub fn record_upload(
+        &self,
+        table: &str,
+        start: DateTime<Utc>,
+        bucket: &str,
+        key: &str,
+        etag: &str,
+        size: u64,
+    ) -> Result<()> {
+        self.connection.execute(
+            "INSERT OR REPLACE INTO parquet_uploads VALUES (?, ?, ?, ?, ?, ?, now())",
+            params![table, start, bucket, key, etag, size],
+        )?;
+        Ok(())
+    }
+
+    pub fn cleanup(&mut self, cutoff: DateTime<Utc>, bucket: &str) -> Result<usize> {
+        let transaction = self.connection.transaction()?;
+        let mut deleted = 0;
+        for table in TABLES {
+            let time_column = if *table == "book_tickers" {
+                "received_at"
+            } else {
+                "event_time"
+            };
+            let sql = format!(
+                "DELETE FROM {table} AS data WHERE {time_column} < ? AND EXISTS (SELECT 1 FROM parquet_uploads AS upload WHERE upload.table_name=? AND upload.bucket=? AND upload.hour_start=date_trunc('hour', data.{time_column}))"
+            );
+            deleted += transaction.execute(&sql, params![cutoff, table, bucket])?;
+        }
+        transaction.commit()?;
+        Ok(deleted)
+    }
 }
 
 fn json_value(value: ValueRef<'_>) -> serde_json::Value {

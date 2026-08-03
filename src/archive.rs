@@ -15,6 +15,9 @@ pub struct Archiver {
     prefix: String,
     directory: PathBuf,
     backfiller: Backfiller,
+    min_retention_hours: u64,
+    max_retention_hours: u64,
+    min_free_disk_percent: u64,
 }
 
 impl Archiver {
@@ -30,10 +33,15 @@ impl Archiver {
             prefix: config.s3_prefix.trim_matches('/').to_owned(),
             directory: config.parquet_dir.clone(),
             backfiller,
+            min_retention_hours: config.min_retention_hours,
+            max_retention_hours: config.max_retention_hours,
+            min_free_disk_percent: config.min_free_disk_percent,
         }
     }
 
     pub async fn export(&self, start: DateTime<Utc>, force: bool) -> Result<Vec<String>> {
+        std::fs::create_dir_all(&self.directory).context("create parquet directory")?;
+        self.cleanup().await?;
         self.backfiller.run().await.context("pre-export backfill")?;
         let start = start
             .with_minute(0)
@@ -46,6 +54,7 @@ impl Archiver {
             .export(start, end, self.directory.clone(), force)
             .await?;
         let mut keys = Vec::with_capacity(files.len());
+        let stamp = start.format("%Y%m%dT%H0000Z").to_string();
         for path in files {
             let filename = path
                 .file_name()
@@ -55,7 +64,8 @@ impl Archiver {
             let body = ByteStream::from_path(&path)
                 .await
                 .context("read parquet file")?;
-            self.client
+            let output = self
+                .client
                 .put_object()
                 .bucket(&self.bucket)
                 .key(&key)
@@ -68,9 +78,50 @@ impl Archiver {
                 .key(&key)
                 .send()
                 .await?;
+            let suffix = format!("_{stamp}.parquet");
+            let table = filename
+                .strip_suffix(&suffix)
+                .context("unexpected parquet filename")?;
+            let size = std::fs::metadata(&path)?.len();
+            self.writer
+                .record_upload(
+                    table.to_owned(),
+                    start,
+                    self.bucket.clone(),
+                    key.clone(),
+                    output.e_tag().unwrap_or_default().to_owned(),
+                    size,
+                )
+                .await?;
             keys.push(key);
         }
+        self.cleanup().await?;
         Ok(keys)
+    }
+
+    async fn cleanup(&self) -> Result<()> {
+        let total = fs2::total_space(&self.directory)?;
+        let available = fs2::available_space(&self.directory)?;
+        let free_percent = available
+            .saturating_mul(100)
+            .checked_div(total)
+            .unwrap_or(100);
+        let hours = if free_percent < self.min_free_disk_percent {
+            self.min_retention_hours
+        } else {
+            self.max_retention_hours
+        };
+        let cutoff = Utc::now() - chrono::Duration::hours(i64::try_from(hours)?);
+        let deleted = self.writer.cleanup(cutoff, self.bucket.clone()).await?;
+        if deleted > 0 {
+            tracing::info!(
+                deleted,
+                free_percent,
+                retention_hours = hours,
+                "cleaned uploaded rows"
+            );
+        }
+        Ok(())
     }
 
     pub fn spawn_hourly(self: Arc<Self>) {
