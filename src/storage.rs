@@ -15,9 +15,7 @@ impl Storage {
             std::fs::create_dir_all(parent).context("create database directory")?;
         }
         let connection = Connection::open(path).context("open DuckDB")?;
-        connection.execute_batch(
-            "SET TimeZone='UTC'; SET memory_limit='160MB'; SET threads=1; SET preserve_insertion_order=false;",
-        )?;
+        configure(&connection)?;
         connection
             .execute_batch(include_str!("schema.sql"))
             .context("initialize schema")?;
@@ -26,9 +24,7 @@ impl Storage {
 
     pub fn open_existing(path: &Path) -> Result<Self> {
         let connection = Connection::open(path).context("open DuckDB")?;
-        connection.execute_batch(
-            "SET TimeZone='UTC'; SET memory_limit='160MB'; SET threads=1; SET preserve_insertion_order=false;",
-        )?;
+        configure(&connection)?;
         Ok(Self { connection })
     }
 
@@ -101,6 +97,19 @@ impl Storage {
             serde_json::json!({"columns": names, "rows": result, "truncated": result.len() == 10_000}),
         )
     }
+}
+
+fn configure(connection: &Connection) -> Result<()> {
+    // Hourly rotation performs an explicit checkpoint. A larger automatic threshold avoids
+    // repeatedly checkpointing a multi-gigabyte active database during ingestion bursts.
+    connection.execute_batch(
+        "SET TimeZone='UTC';
+         SET memory_limit='160MB';
+         SET threads=1;
+         SET preserve_insertion_order=false;
+         SET checkpoint_threshold='1GB';",
+    )?;
+    Ok(())
 }
 
 fn json_value(value: ValueRef<'_>) -> serde_json::Value {

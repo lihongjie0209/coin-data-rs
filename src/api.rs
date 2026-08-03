@@ -28,10 +28,23 @@ pub struct DatasetState {
 pub fn router(state: ApiState) -> Router {
     Router::new()
         .route("/healthz", get(health))
+        .route("/v1/runtime", get(runtime))
         .route("/v1/stats", get(stats))
         .route("/v1/sql", post(sql))
         .route("/v1/archive", post(archive))
         .with_state(state)
+}
+
+async fn runtime(State(state): State<ApiState>) -> Result<Json<Value>, ApiError> {
+    let dataset = state
+        .datasets
+        .values()
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("no active dataset"))?;
+    Ok(Json(json!({
+        "markets": state.datasets.keys().collect::<Vec<_>>(),
+        "runtime": dataset.metrics.snapshot(),
+    })))
 }
 
 async fn health(State(state): State<ApiState>) -> Json<Value> {
