@@ -21,13 +21,6 @@ jobs:
     runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v4
-      - name: Show OIDC identity claims
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const token = await core.getIDToken('sts.amazonaws.com')
-            const claims = JSON.parse(Buffer.from(token.split('.')[1], 'base64url'))
-            core.info(JSON.stringify({aud: claims.aud, sub: claims.sub, repository: claims.repository, ref: claims.ref}))
       - uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: arn:aws:iam::196920285698:role/coin-data-compactor-github

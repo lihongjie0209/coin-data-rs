@@ -9,9 +9,9 @@ Parameters:
     Type: AWS::EC2::VPC::Id
   SubnetIds:
     Type: List<AWS::EC2::Subnet::Id>
-  GitHubRepository:
+  GitHubRepositorySubject:
     Type: String
-    Default: lihongjie0209/coin-data-rs
+    Default: lihongjie0209@21978475/coin-data-rs@1321170332
 
 Resources:
   Repository:
@@ -43,7 +43,7 @@ Resources:
               StringEquals:
                 token.actions.githubusercontent.com:aud: sts.amazonaws.com
               StringLike:
-                token.actions.githubusercontent.com:sub: !Sub repo:${GitHubRepository}:*
+                token.actions.githubusercontent.com:sub: !Sub repo:${GitHubRepositorySubject}:*
       Policies:
         - PolicyName: PushCompactorImage
           PolicyDocument:
