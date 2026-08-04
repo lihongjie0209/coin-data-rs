@@ -1,6 +1,7 @@
 pub mod api;
 pub mod archive;
 pub mod collector;
+pub mod compactor;
 pub mod config;
 pub mod futures_parser;
 pub mod futures_poll;

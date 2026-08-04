@@ -1,0 +1,14 @@
+{
+  "Rules": [
+    {
+      "ID": "expire-compaction-sources-after-seven-days",
+      "Status": "Enabled",
+      "Filter": {
+        "Prefix": "parquet/compaction-source/"
+      },
+      "Expiration": {
+        "Days": 7
+      }
+    }
+  ]
+}

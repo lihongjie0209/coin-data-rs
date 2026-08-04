@@ -1,0 +1,239 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Scheduled Parquet compaction on ARM64 ECS Fargate
+
+Parameters:
+  BucketName:
+    Type: String
+    Default: coin-data-196920285698-ap-southeast-1-an
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+  GitHubRepository:
+    Type: String
+    Default: lihongjie0209/coin-data-rs
+
+Resources:
+  Repository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: coin-data-parquet-compactor
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      ImageTagMutability: MUTABLE
+
+  GitHubOidcProvider:
+    Type: AWS::IAM::OIDCProvider
+    Properties:
+      Url: https://token.actions.githubusercontent.com
+      ClientIdList: [sts.amazonaws.com]
+
+  GitHubRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: coin-data-compactor-github
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !Ref GitHubOidcProvider
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                token.actions.githubusercontent.com:aud: sts.amazonaws.com
+              StringLike:
+                token.actions.githubusercontent.com:sub: !Sub repo:${GitHubRepository}:*
+      Policies:
+        - PolicyName: PushCompactorImage
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: ecr:GetAuthorizationToken
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:CompleteLayerUpload
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:InitiateLayerUpload
+                  - ecr:PutImage
+                  - ecr:UploadLayerPart
+                Resource: !GetAtt Repository.Arn
+
+  Cluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: coin-data-batch
+      CapacityProviders: [FARGATE, FARGATE_SPOT]
+      DefaultCapacityProviderStrategy:
+        - CapacityProvider: FARGATE
+          Weight: 1
+
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /ecs/coin-data-parquet-compactor
+      RetentionInDays: 14
+
+  SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Egress-only access for Parquet compactor
+      GroupName: coin-data-parquet-compactor
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - IpProtocol: '-1'
+          CidrIp: 0.0.0.0/0
+
+  TaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: coin-data-compactor-execution
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+
+  TaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: coin-data-compactor-task
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: CompactParquetObjects
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetBucketLocation
+                  - s3:ListBucket
+                Resource: !Sub arn:${AWS::Partition}:s3:::${BucketName}
+                Condition:
+                  StringLike:
+                    s3:prefix:
+                      - parquet/rust/*
+                      - parquet/compaction-source/*
+                      - parquet/compaction-source-control/*
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                Resource:
+                  - !Sub arn:${AWS::Partition}:s3:::${BucketName}/parquet/rust/*
+                  - !Sub arn:${AWS::Partition}:s3:::${BucketName}/parquet/compaction-source/*
+                  - !Sub arn:${AWS::Partition}:s3:::${BucketName}/parquet/compaction-source-control/*
+
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: coin-data-parquet-compactor
+      Cpu: '1024'
+      Memory: '2048'
+      NetworkMode: awsvpc
+      RequiresCompatibilities: [FARGATE]
+      RuntimePlatform:
+        CpuArchitecture: ARM64
+        OperatingSystemFamily: LINUX
+      ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt TaskRole.Arn
+      ContainerDefinitions:
+        - Name: compactor
+          Essential: true
+          Image: !Sub ${AWS::AccountId}.dkr.ecr.${AWS::Region}.${AWS::URLSuffix}/coin-data-parquet-compactor:latest
+          Command: [--execute]
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: compactor
+
+  DeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: coin-data-parquet-compactor-dlq
+      MessageRetentionPeriod: 1209600
+
+  SchedulerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: coin-data-compactor-scheduler
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: scheduler.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: RunCompactorTask
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: ecs:RunTask
+                Resource: !Ref TaskDefinition
+              - Effect: Allow
+                Action: iam:PassRole
+                Resource:
+                  - !GetAtt TaskExecutionRole.Arn
+                  - !GetAtt TaskRole.Arn
+              - Effect: Allow
+                Action: sqs:SendMessage
+                Resource: !GetAtt DeadLetterQueue.Arn
+
+  Schedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: coin-data-parquet-compactor-8h
+      Description: Scan and compact completed Parquet partitions every eight hours
+      State: DISABLED
+      ScheduleExpression: cron(15 0/8 * * ? *)
+      ScheduleExpressionTimezone: UTC
+      FlexibleTimeWindow:
+        Mode: 'OFF'
+      Target:
+        Arn: !GetAtt Cluster.Arn
+        RoleArn: !GetAtt SchedulerRole.Arn
+        DeadLetterConfig:
+          Arn: !GetAtt DeadLetterQueue.Arn
+        RetryPolicy:
+          MaximumEventAgeInSeconds: 21600
+          MaximumRetryAttempts: 2
+        EcsParameters:
+          TaskDefinitionArn: !Ref TaskDefinition
+          TaskCount: 1
+          LaunchType: FARGATE
+          PlatformVersion: LATEST
+          NetworkConfiguration:
+            AwsvpcConfiguration:
+              AssignPublicIp: ENABLED
+              SecurityGroups: [!Ref SecurityGroup]
+              Subnets: !Ref SubnetIds
+
+Outputs:
+  ClusterArn:
+    Value: !GetAtt Cluster.Arn
+  RepositoryUri:
+    Value: !GetAtt Repository.RepositoryUri
+  ScheduleName:
+    Value: !Ref Schedule
+  SecurityGroupId:
+    Value: !Ref SecurityGroup
+  TaskDefinitionArn:
+    Value: !Ref TaskDefinition
