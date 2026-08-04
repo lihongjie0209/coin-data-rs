@@ -2,8 +2,9 @@ use std::{
     collections::HashMap,
     path::{Path, PathBuf},
     sync::{
-        Arc, Mutex,
+        Arc,
         atomic::{AtomicU64, Ordering},
+        mpsc as std_mpsc,
     },
     time::{Duration, Instant},
 };
@@ -23,6 +24,20 @@ enum Command {
     Records(Vec<Record>),
     Tick,
     Flush(oneshot::Sender<Result<()>>),
+}
+
+struct EncodeJob {
+    market: Market,
+    hour: DateTime<Utc>,
+    sequence: u64,
+    table: &'static str,
+    records: Vec<Record>,
+    bytes: usize,
+}
+
+enum EncodeCommand {
+    Write(EncodeJob),
+    Barrier(std_mpsc::Sender<Result<()>>),
 }
 
 #[derive(Clone)]
@@ -52,14 +67,20 @@ struct BufferedTable {
     first_seen: Instant,
 }
 
+pub struct WriterSettings {
+    pub capacity: usize,
+    pub buffer_bytes: usize,
+    pub segment_bytes: usize,
+    pub flush_interval: Duration,
+    pub encoder_queue_capacity: usize,
+    pub encoder_delay: Duration,
+}
+
 impl Writer {
     pub fn start(
         database: PathBuf,
         exchange: String,
-        capacity: usize,
-        buffer_bytes: usize,
-        segment_bytes: usize,
-        flush_interval: Duration,
+        settings: WriterSettings,
         metrics: Arc<Metrics>,
     ) -> Result<(Self, mpsc::UnboundedReceiver<Segment>)> {
         let directory = database
@@ -72,51 +93,47 @@ impl Writer {
         let buffered_bytes = Arc::new(AtomicU64::new(0));
         let parquet_segments = Arc::new(AtomicU64::new(0));
         let parquet_bytes = Arc::new(AtomicU64::new(0));
-        let encoder_lock = Arc::new(Mutex::new(()));
+        let (encoder_sender, encoder_receiver) =
+            std_mpsc::sync_channel(settings.encoder_queue_capacity);
+        start_encoder(
+            encoder_receiver,
+            EncoderOptions {
+                directory: directory.clone(),
+                exchange: exchange.clone(),
+                delay: settings.encoder_delay,
+                metrics: Arc::clone(&metrics),
+                buffered_bytes: Arc::clone(&buffered_bytes),
+                parquet_segments: Arc::clone(&parquet_segments),
+                parquet_bytes: Arc::clone(&parquet_bytes),
+                segment_sender: segment_sender.clone(),
+            },
+        )?;
         let spot = start_worker(WorkerOptions {
             market: Market::Spot,
-            directory: directory.clone(),
-            exchange: exchange.clone(),
-            capacity,
-            buffer_bytes,
-            segment_bytes,
-            flush_interval,
-            metrics: Arc::clone(&metrics),
+            capacity: settings.capacity,
+            buffer_bytes: settings.buffer_bytes,
+            segment_bytes: settings.segment_bytes,
+            flush_interval: settings.flush_interval,
             buffered_bytes: Arc::clone(&buffered_bytes),
-            parquet_segments: Arc::clone(&parquet_segments),
-            parquet_bytes: Arc::clone(&parquet_bytes),
-            segment_sender: segment_sender.clone(),
-            encoder_lock: Arc::clone(&encoder_lock),
+            encoder_sender: encoder_sender.clone(),
         })?;
         let usdm = start_worker(WorkerOptions {
             market: Market::Usdm,
-            directory: directory.clone(),
-            exchange: exchange.clone(),
-            capacity,
-            buffer_bytes,
-            segment_bytes,
-            flush_interval,
-            metrics: Arc::clone(&metrics),
+            capacity: settings.capacity,
+            buffer_bytes: settings.buffer_bytes,
+            segment_bytes: settings.segment_bytes,
+            flush_interval: settings.flush_interval,
             buffered_bytes: Arc::clone(&buffered_bytes),
-            parquet_segments: Arc::clone(&parquet_segments),
-            parquet_bytes: Arc::clone(&parquet_bytes),
-            segment_sender: segment_sender.clone(),
-            encoder_lock: Arc::clone(&encoder_lock),
+            encoder_sender: encoder_sender.clone(),
         })?;
         let coinm = start_worker(WorkerOptions {
             market: Market::Coinm,
-            directory: directory.clone(),
-            exchange: exchange.clone(),
-            capacity,
-            buffer_bytes,
-            segment_bytes,
-            flush_interval,
-            metrics: Arc::clone(&metrics),
+            capacity: settings.capacity,
+            buffer_bytes: settings.buffer_bytes,
+            segment_bytes: settings.segment_bytes,
+            flush_interval: settings.flush_interval,
             buffered_bytes: Arc::clone(&buffered_bytes),
-            parquet_segments: Arc::clone(&parquet_segments),
-            parquet_bytes: Arc::clone(&parquet_bytes),
-            segment_sender,
-            encoder_lock,
+            encoder_sender,
         })?;
         Ok((
             Self {
@@ -195,18 +212,81 @@ impl Writer {
 
 struct WorkerOptions {
     market: Market,
-    directory: PathBuf,
-    exchange: String,
     capacity: usize,
     buffer_bytes: usize,
     segment_bytes: usize,
     flush_interval: Duration,
+    buffered_bytes: Arc<AtomicU64>,
+    encoder_sender: std_mpsc::SyncSender<EncodeCommand>,
+}
+
+struct EncoderOptions {
+    directory: PathBuf,
+    exchange: String,
+    delay: Duration,
     metrics: Arc<Metrics>,
     buffered_bytes: Arc<AtomicU64>,
     parquet_segments: Arc<AtomicU64>,
     parquet_bytes: Arc<AtomicU64>,
     segment_sender: mpsc::UnboundedSender<Segment>,
-    encoder_lock: Arc<Mutex<()>>,
+}
+
+fn start_encoder(
+    receiver: std_mpsc::Receiver<EncodeCommand>,
+    options: EncoderOptions,
+) -> Result<()> {
+    std::thread::Builder::new()
+        .name("parquet-encoder".to_owned())
+        .spawn(move || {
+            let mut pending_error: Option<String> = None;
+            while let Ok(command) = receiver.recv() {
+                match command {
+                    EncodeCommand::Write(job) => {
+                        let result = write_segment(
+                            &options.directory,
+                            &options.exchange,
+                            job.market,
+                            job.hour,
+                            job.sequence,
+                            job.table,
+                            &job.records,
+                        );
+                        options
+                            .buffered_bytes
+                            .fetch_sub(job.bytes as u64, Ordering::Relaxed);
+                        match result {
+                            Ok(segment) => {
+                                options
+                                    .metrics
+                                    .written_records
+                                    .fetch_add(segment.rows as u64, Ordering::Relaxed);
+                                options.parquet_segments.fetch_add(1, Ordering::Relaxed);
+                                options
+                                    .parquet_bytes
+                                    .fetch_add(segment.bytes, Ordering::Relaxed);
+                                let _ = options.segment_sender.send(segment);
+                            }
+                            Err(error) => {
+                                let message = format!("{error:#}");
+                                tracing::error!(error = %message, "Parquet encoding failed");
+                                pending_error.get_or_insert(message);
+                            }
+                        }
+                        if !options.delay.is_zero() {
+                            std::thread::sleep(options.delay);
+                        }
+                    }
+                    EncodeCommand::Barrier(response) => {
+                        let result = pending_error
+                            .take()
+                            .map_or_else(|| Ok(()), |error| Err(anyhow::anyhow!(error)));
+                        let _ = response.send(result);
+                    }
+                }
+            }
+        })
+        .context("start Parquet encoder thread")?;
+    Ok(())
 }
 
 fn start_worker(options: WorkerOptions) -> Result<mpsc::Sender<Command>> {
@@ -291,7 +371,20 @@ fn worker_run(mut receiver: mpsc::Receiver<Command>, options: WorkerOptions) -> 
                     let _ = response.send(Err(anyhow::anyhow!(format!("{error:#}"))));
                     return Err(error);
                 }
-                let _ = response.send(Ok(()));
+                let (barrier_sender, barrier_receiver) = std_mpsc::channel();
+                if options
+                    .encoder_sender
+                    .send(EncodeCommand::Barrier(barrier_sender))
+                    .is_err()
+                {
+                    let error = anyhow::anyhow!("Parquet encoder stopped");
+                    let _ = response.send(Err(anyhow::anyhow!(error.to_string())));
+                    return Err(error);
+                }
+                let result = barrier_receiver
+                    .recv()
+                    .context("Parquet encoder dropped flush response")?;
+                let _ = response.send(result);
             }
         }
     }
@@ -343,32 +436,18 @@ fn flush_table(
         return Ok(());
     }
     state.sequence = state.sequence.wrapping_add(1);
-    let _encoder = options
-        .encoder_lock
-        .lock()
-        .map_err(|_| anyhow::anyhow!("Parquet encoder lock poisoned"))?;
-    let segment = write_segment(
-        &options.directory,
-        &options.exchange,
-        state.market,
-        state.hour,
-        state.sequence,
-        table,
-        &buffer.records,
-    )?;
+    options
+        .encoder_sender
+        .send(EncodeCommand::Write(EncodeJob {
+            market: state.market,
+            hour: state.hour,
+            sequence: state.sequence,
+            table,
+            records: buffer.records,
+            bytes: buffer.bytes,
+        }))
+        .map_err(|_| anyhow::anyhow!("Parquet encoder stopped"))?;
     state.buffered_bytes = state.buffered_bytes.saturating_sub(buffer.bytes);
-    options
-        .buffered_bytes
-        .fetch_sub(buffer.bytes as u64, Ordering::Relaxed);
-    options
-        .metrics
-        .written_records
-        .fetch_add(segment.rows as u64, Ordering::Relaxed);
-    options.parquet_segments.fetch_add(1, Ordering::Relaxed);
-    options
-        .parquet_bytes
-        .fetch_add(segment.bytes, Ordering::Relaxed);
-    let _ = options.segment_sender.send(segment);
     Ok(())
 }
 
@@ -378,4 +457,62 @@ pub fn floor_hour(value: DateTime<Utc>) -> Result<DateTime<Utc>> {
         .and_then(|value| value.with_second(0))
         .and_then(|value| value.with_nanosecond(0))
         .context("invalid UTC hour")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::TimeZone;
+    use tempfile::tempdir;
+
+    use crate::model::{Value, decimal, text, timestamp};
+
+    #[tokio::test]
+    async fn flush_should_wait_for_queued_encoding() -> Result<()> {
+        let directory = tempdir()?;
+        let metrics = Arc::new(Metrics::default());
+        let (writer, mut segments) = Writer::start(
+            directory.path().join("market.parquet"),
+            "binance".to_owned(),
+            WriterSettings {
+                capacity: 16,
+                buffer_bytes: 1_024 * 1_024,
+                segment_bytes: 1_024 * 1_024,
+                flush_interval: Duration::from_secs(300),
+                encoder_queue_capacity: 1,
+                encoder_delay: Duration::ZERO,
+            },
+            metrics,
+        )?;
+        let time = Utc
+            .timestamp_opt(1_785_715_200, 0)
+            .single()
+            .context("test timestamp")?;
+        writer
+            .records(
+                Market::Spot,
+                vec![Record {
+                    table: "trades",
+                    values: vec![
+                        timestamp(time),
+                        timestamp(time),
+                        text("BTCUSDT"),
+                        Value::U64(1),
+                        decimal(100_000_000_000_000_000_000),
+                        decimal(1_000_000_000_000_000_000),
+                        timestamp(time),
+                        Value::Boolean(true),
+                        Value::Boolean(true),
+                        text("queue-test"),
+                    ],
+                }],
+            )
+            .await?;
+
+        writer.flush().await?;
+
+        let segment = segments.try_recv().context("encoded segment missing")?;
+        assert_eq!(segment.rows, 1);
+        Ok(())
+    }
 }

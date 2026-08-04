@@ -10,7 +10,7 @@ use coin_data_rs::{
     futures_poll::OpenInterestPoller,
     notify::TelegramNotifier,
     runtime::Metrics,
-    writer::Writer,
+    writer::{Writer, WriterSettings},
 };
 use tokio::net::TcpListener;
 use tracing_subscriber::EnvFilter;
@@ -30,10 +30,14 @@ async fn main() -> Result<()> {
     let (writer, completed_segments) = Writer::start(
         root_config.database.clone(),
         root_config.exchange.as_str().to_owned(),
-        root_config.queue_capacity,
-        buffer_mb.saturating_mul(1_024 * 1_024),
-        segment_mb.saturating_mul(1_024 * 1_024),
-        root_config.flush_interval(),
+        WriterSettings {
+            capacity: root_config.queue_capacity,
+            buffer_bytes: buffer_mb.saturating_mul(1_024 * 1_024),
+            segment_bytes: segment_mb.saturating_mul(1_024 * 1_024),
+            flush_interval: root_config.flush_interval(),
+            encoder_queue_capacity: root_config.parquet_queue_capacity,
+            encoder_delay: std::time::Duration::from_millis(root_config.parquet_write_delay_ms),
+        },
         Arc::clone(&metrics),
     )?;
     let notifier = TelegramNotifier::from_env(

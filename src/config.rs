@@ -83,6 +83,18 @@ pub struct Config {
     pub queue_capacity: usize,
     #[arg(
         long,
+        default_value_t = 4,
+        help = "maximum number of completed in-memory buffers waiting for Parquet encoding"
+    )]
+    pub parquet_queue_capacity: usize,
+    #[arg(
+        long,
+        default_value_t = 250,
+        help = "minimum pause in milliseconds between Parquet encoding jobs"
+    )]
+    pub parquet_write_delay_ms: u64,
+    #[arg(
+        long,
         default_value_t = 0,
         help = "in-memory buffer budget per market in MiB; 0 selects automatically"
     )]
@@ -147,6 +159,8 @@ impl Config {
         }
         NonZeroUsize::new(self.queue_capacity)
             .ok_or_else(|| anyhow::anyhow!("queue capacity must be positive"))?;
+        NonZeroUsize::new(self.parquet_queue_capacity)
+            .ok_or_else(|| anyhow::anyhow!("Parquet queue capacity must be positive"))?;
         if self.buffer_mb > 0 && self.segment_mb > self.buffer_mb {
             bail!("segment size must not exceed the per-market buffer size");
         }
