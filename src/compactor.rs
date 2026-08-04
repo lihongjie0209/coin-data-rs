@@ -5,7 +5,7 @@ use aws_config::{BehaviorVersion, Region};
 use aws_sdk_s3::{
     Client,
     primitives::ByteStream,
-    types::{Delete, ObjectIdentifier},
+    types::{Delete, ObjectIdentifier, StorageClass},
 };
 use chrono::{DateTime, NaiveDateTime, TimeDelta, Utc};
 use clap::Parser;
@@ -357,6 +357,7 @@ impl Compactor {
             .put_object()
             .bucket(&self.options.bucket)
             .key(key)
+            .storage_class(StorageClass::IntelligentTiering)
             .body(ByteStream::from_path(path).await?)
             .send()
             .await

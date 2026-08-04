@@ -48,7 +48,7 @@ parquet-bench --source /path/to/history --output /tmp/parquet-bench --seconds 60
 
 ## Scheduled compaction
 
-`parquet-compact` scans completed hourly S3 partitions and merges eligible `segment-*.parquet` objects with bounded Arrow batches. It is dry-run by default; `--execute` enables writes. Successful runs copy source objects to `parquet/compaction-source/`, publish a success marker, and then remove the small objects from the production prefix. S3 Lifecycle retains the copied sources for seven days.
+`parquet-compact` scans completed hourly S3 partitions and merges eligible `segment-*.parquet` objects with bounded Arrow batches. It is dry-run by default; `--execute` enables writes. Successful runs store `compacted.parquet` in S3 Intelligent-Tiering, copy source objects to `parquet/compaction-source/`, publish a success marker, and then remove the small objects from the production prefix. S3 Lifecycle retains the copied sources for one day.
 
 The Fargate resources are defined in `deploy/compactor-cloudformation.yml`. EventBridge Scheduler starts one ARM64 task at 00:15, 08:15, and 16:15 UTC.
 
