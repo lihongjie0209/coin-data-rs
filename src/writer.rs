@@ -212,9 +212,9 @@ struct WorkerOptions {
 fn start_worker(options: WorkerOptions) -> Result<mpsc::Sender<Command>> {
     let (sender, receiver) = mpsc::channel(options.capacity);
     let flush_sender = sender.clone();
-    let flush_interval = options.flush_interval;
+    let tick_interval = options.flush_interval.min(Duration::from_secs(5));
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(flush_interval);
+        let mut interval = tokio::time::interval(tick_interval);
         interval.tick().await;
         loop {
             interval.tick().await;
