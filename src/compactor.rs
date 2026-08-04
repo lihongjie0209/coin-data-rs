@@ -248,17 +248,32 @@ impl Compactor {
             .sources
             .sort_by(|left, right| left.key.cmp(&right.key));
         let success_key = format!("{}/{}", partition.prefix, SUCCESS_NAME);
+        let output_key = format!("{}/{}", partition.prefix, OUTPUT_NAME);
+        let mut merge_sources = partition.sources.clone();
         if self.exists(&success_key).await? {
-            self.delete_sources(&partition.sources).await?;
-            return Ok(());
+            let existing = self
+                .client
+                .head_object()
+                .bucket(&self.options.bucket)
+                .key(&output_key)
+                .send()
+                .await
+                .context("completed partition is missing its compacted output")?;
+            merge_sources.insert(
+                0,
+                Source {
+                    key: output_key.clone(),
+                    bytes: u64::try_from(existing.content_length().unwrap_or_default())
+                        .unwrap_or_default(),
+                },
+            );
         }
         let temporary = tempfile::tempdir().context("create compaction workspace")?;
         let output = temporary.path().join(OUTPUT_NAME);
         let rows = self
-            .merge(&partition.sources, temporary.path(), &output)
+            .merge(&merge_sources, temporary.path(), &output)
             .await?;
         verify_output(&output, rows)?;
-        let output_key = format!("{}/{}", partition.prefix, OUTPUT_NAME);
         self.upload(&output_key, &output).await?;
         self.retain_sources(&partition.sources, &partition.prefix)
             .await?;
