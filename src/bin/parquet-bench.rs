@@ -8,6 +8,7 @@ use std::{
 use anyhow::{Context, Result, bail};
 use arrow_schema::Schema;
 use clap::Parser;
+use coin_data_rs::compactor::reorder_batch;
 use parquet::{
     arrow::{ArrowWriter, arrow_reader::ParquetRecordBatchReaderBuilder},
     basic::{Compression, ZstdLevel},
@@ -22,10 +23,19 @@ struct Options {
     output: PathBuf,
     #[arg(long, default_value_t = 60)]
     seconds: u64,
+    #[arg(long, default_value_t = 1)]
+    zstd_level: i32,
+    #[arg(long, default_value_t = 131_072)]
+    row_group_rows: usize,
+    #[arg(long)]
+    sort_by_symbol: bool,
 }
 
 fn main() -> Result<()> {
     let options = Options::parse();
+    if options.row_group_rows == 0 {
+        bail!("row-group-rows must be positive");
+    }
     let sources = parquet_files(&options.source)?;
     if sources.is_empty() {
         bail!("no Parquet history found in {}", options.source.display());
@@ -42,7 +52,14 @@ fn main() -> Result<()> {
             if Instant::now() >= deadline {
                 break;
             }
-            let result = rewrite(source, &options.output, files)?;
+            let result = rewrite(
+                source,
+                &options.output,
+                files,
+                options.zstd_level,
+                options.row_group_rows,
+                options.sort_by_symbol,
+            )?;
             rows = rows.saturating_add(result.rows);
             input_bytes = input_bytes.saturating_add(result.input_bytes);
             output_bytes = output_bytes.saturating_add(result.output_bytes);
@@ -60,6 +77,9 @@ fn main() -> Result<()> {
             "input_bytes": input_bytes,
             "output_bytes": output_bytes,
             "output_mib_per_second": output_bytes as f64 / 1_048_576.0 / elapsed,
+            "zstd_level": options.zstd_level,
+            "row_group_rows": options.row_group_rows,
+            "sort_by_symbol": options.sort_by_symbol,
         })
     );
     Ok(())
@@ -71,21 +91,33 @@ struct RewriteResult {
     output_bytes: u64,
 }
 
-fn rewrite(source: &Path, output: &Path, sequence: u64) -> Result<RewriteResult> {
+fn rewrite(
+    source: &Path,
+    output: &Path,
+    sequence: u64,
+    zstd_level: i32,
+    row_group_rows: usize,
+    sort_by_symbol: bool,
+) -> Result<RewriteResult> {
     let input = File::open(source)?;
     let builder = ParquetRecordBatchReaderBuilder::try_new(input)?;
     let schema: Arc<Schema> = builder.schema().clone();
     let mut reader = builder.with_batch_size(65_536).build()?;
     let path = output.join(format!("bench-{sequence:08}.parquet"));
     let properties = WriterProperties::builder()
-        .set_compression(Compression::ZSTD(ZstdLevel::try_new(1)?))
+        .set_compression(Compression::ZSTD(ZstdLevel::try_new(zstd_level)?))
+        .set_max_row_group_row_count(Some(row_group_rows))
         .build();
     let mut writer = ArrowWriter::try_new(File::create(&path)?, schema, Some(properties))?;
     let mut rows = 0u64;
     for batch in &mut reader {
         let batch = batch.context("read historical Parquet batch")?;
         rows = rows.saturating_add(batch.num_rows() as u64);
-        writer.write(&batch)?;
+        if sort_by_symbol {
+            writer.write(&reorder_batch(&batch)?)?;
+        } else {
+            writer.write(&batch)?;
+        }
     }
     writer.close()?;
     Ok(RewriteResult {

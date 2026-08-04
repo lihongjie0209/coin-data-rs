@@ -1,6 +1,10 @@
 use std::{collections::BTreeMap, fs::File, path::Path, sync::Arc};
 
 use anyhow::{Context, Result, bail};
+use arrow_array::RecordBatch;
+use arrow_ord::sort::{SortColumn, lexsort_to_indices};
+use arrow_schema::ArrowError;
+use arrow_select::take::take;
 use aws_config::{BehaviorVersion, Region};
 use aws_sdk_s3::{
     Client,
@@ -325,7 +329,7 @@ impl Compactor {
             for batch in &mut reader {
                 let batch = batch.with_context(|| format!("read {}", source.key))?;
                 rows = rows.saturating_add(batch.num_rows() as u64);
-                current.write(&batch)?;
+                current.write(&reorder_batch(&batch)?)?;
             }
             std::fs::remove_file(&input)?;
         }
@@ -467,9 +471,36 @@ fn validate(options: &Options) -> Result<()> {
 
 fn writer_properties() -> Result<WriterProperties> {
     Ok(WriterProperties::builder()
-        .set_compression(Compression::ZSTD(ZstdLevel::try_new(1)?))
-        .set_max_row_group_row_count(Some(131_072))
+        .set_compression(Compression::ZSTD(ZstdLevel::try_new(3)?))
+        .set_max_row_group_row_count(Some(1_048_576))
         .build())
+}
+
+pub fn reorder_batch(batch: &RecordBatch) -> Result<RecordBatch> {
+    let Ok(symbol) = batch.schema().index_of("symbol") else {
+        return Ok(batch.clone());
+    };
+    let mut sort_columns = vec![SortColumn {
+        values: batch.column(symbol).clone(),
+        options: None,
+    }];
+    for name in ["event_time", "observed_at", "received_at"] {
+        let Ok(index) = batch.schema().index_of(name) else {
+            continue;
+        };
+        sort_columns.push(SortColumn {
+            values: batch.column(index).clone(),
+            options: None,
+        });
+        break;
+    }
+    let indices = lexsort_to_indices(&sort_columns, None)?;
+    let columns = batch
+        .columns()
+        .iter()
+        .map(|column| take(column.as_ref(), &indices, None))
+        .collect::<Result<Vec<_>, ArrowError>>()?;
+    Ok(RecordBatch::try_new(batch.schema(), columns)?)
 }
 
 fn verify_output(path: &Path, expected_rows: u64) -> Result<()> {
@@ -501,6 +532,11 @@ fn partition_from_key(key: &str) -> Option<(String, DateTime<Utc>)> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use arrow_array::{Int64Array, StringArray};
+    use arrow_schema::{DataType, Field, Schema};
+
     use super::*;
 
     #[test]
@@ -520,5 +556,54 @@ mod tests {
     #[test]
     fn compacted_output_should_not_be_a_source() {
         assert!(!is_source_key("path/compacted.parquet"));
+    }
+
+    #[test]
+    fn reorder_batch_should_sort_by_symbol_then_event_time() -> Result<()> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("symbol", DataType::Utf8, false),
+            Field::new("event_time", DataType::Int64, false),
+            Field::new("value", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec!["B", "A", "B", "A"])),
+                Arc::new(Int64Array::from(vec![2, 2, 1, 1])),
+                Arc::new(Int64Array::from(vec![20, 12, 10, 11])),
+            ],
+        )?;
+
+        let sorted = reorder_batch(&batch)?;
+        let symbols = sorted
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .context("symbol column")?;
+        let times = sorted
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .context("time column")?;
+        let values = sorted
+            .column(2)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .context("value column")?;
+        let actual = (0..sorted.num_rows())
+            .map(|index| {
+                (
+                    symbols.value(index),
+                    times.value(index),
+                    values.value(index),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            actual,
+            vec![("A", 1, 11), ("A", 2, 12), ("B", 1, 10), ("B", 2, 20)]
+        );
+        Ok(())
     }
 }

@@ -184,6 +184,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "arrow-ord"
+version = "59.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0e13dbdc2a9c053c10c7baa6e30faee04a180aa7ce88e471835850ce37abd20b"
+dependencies = [
+ "arrow-array",
+ "arrow-buffer",
+ "arrow-data",
+ "arrow-schema",
+ "arrow-select",
+]
+
+[[package]]
 name = "arrow-schema"
 version = "59.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1005,7 +1018,9 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "arrow-array",
+ "arrow-ord",
  "arrow-schema",
+ "arrow-select",
  "async-trait",
  "aws-config",
  "aws-sdk-s3",
