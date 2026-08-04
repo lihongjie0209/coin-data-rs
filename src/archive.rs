@@ -45,9 +45,13 @@ impl Archiver {
             .region(Region::new(config.aws_region.clone()))
             .load()
             .await;
+        let mut s3 = aws_sdk_s3::config::Builder::from(&sdk);
+        if let Some(endpoint) = &config.s3_endpoint {
+            s3 = s3.endpoint_url(endpoint).force_path_style(false);
+        }
         Self {
             writer,
-            client: Client::new(&sdk),
+            client: Client::from_conf(s3.build()),
             bucket: config.s3_bucket.clone(),
             prefix: config.s3_prefix.trim_matches('/').to_owned(),
             min_retention_hours: config.min_retention_hours,

@@ -107,6 +107,11 @@ pub struct Config {
     pub s3_prefix: String,
     #[arg(long, default_value = "ap-southeast-1")]
     pub aws_region: String,
+    #[arg(
+        long,
+        help = "custom S3-compatible endpoint; virtual-hosted addressing is used"
+    )]
+    pub s3_endpoint: Option<String>,
     #[arg(long, default_value_t = 2)]
     pub min_retention_hours: u64,
     #[arg(long, default_value_t = 2)]
