@@ -1,4 +1,4 @@
-use std::{num::NonZeroUsize, path::PathBuf, time::Duration};
+use std::{fs, num::NonZeroUsize, path::PathBuf, time::Duration};
 
 use anyhow::{Result, bail};
 use clap::{Parser, ValueEnum};
@@ -83,13 +83,19 @@ pub struct Config {
     pub queue_capacity: usize,
     #[arg(
         long,
-        default_value_t = 100,
-        help = "in-memory buffer budget per market in MiB"
+        default_value_t = 0,
+        help = "in-memory buffer budget per market in MiB; 0 selects automatically"
     )]
     pub buffer_mb: usize,
     #[arg(
         long,
-        default_value_t = 30,
+        default_value_t = 0,
+        help = "target uncompressed size of each table segment in MiB; 0 selects automatically"
+    )]
+    pub segment_mb: usize,
+    #[arg(
+        long,
+        default_value_t = 300,
         help = "maximum seconds before buffered records are flushed"
     )]
     flush_seconds: u64,
@@ -136,8 +142,9 @@ impl Config {
         }
         NonZeroUsize::new(self.queue_capacity)
             .ok_or_else(|| anyhow::anyhow!("queue capacity must be positive"))?;
-        NonZeroUsize::new(self.buffer_mb)
-            .ok_or_else(|| anyhow::anyhow!("buffer size must be positive"))?;
+        if self.buffer_mb > 0 && self.segment_mb > self.buffer_mb {
+            bail!("segment size must not exceed the per-market buffer size");
+        }
         if self.min_retention_hours == 0 || self.max_retention_hours < self.min_retention_hours {
             bail!("retention must keep at least 1 hour and max must be >= min");
         }
@@ -145,6 +152,27 @@ impl Config {
             bail!("minimum free disk percent must be <= 100");
         }
         Ok(())
+    }
+
+    pub fn buffer_sizes(&self) -> Result<(usize, usize)> {
+        let market_count = if self.all_markets { 3 } else { 1 };
+        let memory_mb = memory_limit_bytes().unwrap_or(1_024 * 1_024 * 1_024) / (1_024 * 1_024);
+        let automatic_buffer = (memory_mb.saturating_mul(30) / 100 / market_count).clamp(32, 256);
+        let buffer_mb = if self.buffer_mb == 0 {
+            automatic_buffer
+        } else {
+            self.buffer_mb
+        };
+        let automatic_segment = (buffer_mb / 2).clamp(16, 64).min(buffer_mb);
+        let segment_mb = if self.segment_mb == 0 {
+            automatic_segment
+        } else {
+            self.segment_mb
+        };
+        if segment_mb > buffer_mb {
+            bail!("segment size must not exceed the per-market buffer size");
+        }
+        Ok((buffer_mb, segment_mb))
     }
 
     pub fn symbols(&self) -> Vec<String> {
@@ -373,6 +401,28 @@ impl Config {
         }
         shards
     }
+}
+
+fn memory_limit_bytes() -> Option<usize> {
+    let physical = fs::read_to_string("/proc/meminfo")
+        .ok()?
+        .lines()
+        .find_map(|line| {
+            let value = line.strip_prefix("MemTotal:")?;
+            value.split_whitespace().next()?.parse::<usize>().ok()
+        })?
+        .saturating_mul(1_024);
+    let cgroup = fs::read_to_string("/proc/self/cgroup")
+        .ok()
+        .and_then(|content| {
+            content.lines().find_map(|line| {
+                let path = line.strip_prefix("0::")?;
+                let path = format!("/sys/fs/cgroup{path}/memory.max");
+                fs::read_to_string(path).ok()
+            })
+        })
+        .and_then(|value| value.trim().parse::<usize>().ok());
+    Some(cgroup.map_or(physical, |limit| limit.min(physical)))
 }
 
 fn csv(value: &str, uppercase: bool) -> Vec<String> {

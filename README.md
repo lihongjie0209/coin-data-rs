@@ -2,7 +2,7 @@
 
 Rust Binance Spot, USDⓈ-M, and COIN-M real-time market-data collector. One process supervises all three markets, preserves documented fields in typed Parquet columns, and asynchronously uploads completed segments to S3.
 
-DuckDB is not used. Spot, USD-M, and COIN-M each have a dedicated writer thread, bounded queue, and a 100 MiB in-memory budget. A market flushes when its budget is reached, after 30 seconds, or at an UTC hour boundary. Every table becomes an independently closed Parquet segment through a `.tmp` file followed by an atomic rename. S3 failures retain the local segment for retry and never block WebSocket ingestion.
+DuckDB is not used. Spot, USD-M, and COIN-M each have a dedicated writer thread and bounded queue. By default, the service derives safe per-market and per-table memory budgets from the host or cgroup memory limit. A table flushes when its target is reached, when its market reaches the memory limit, after five minutes, or at an UTC hour boundary. Every table becomes an independently closed Parquet segment through a `.tmp` file followed by an atomic rename. S3 failures retain the local segment for retry and never block WebSocket ingestion.
 
 ## Run
 
@@ -10,7 +10,7 @@ DuckDB is not used. Spot, USD-M, and COIN-M each have a dedicated writer thread,
 cargo run --release -- --database data/market
 ```
 
-The parent of `--database` is the data root. Defaults can be changed with `--buffer-mb`, `--queue-capacity`, and `--flush-seconds`. All currently tradable instruments and all three Binance markets are enabled by default. Aggregate-trade REST backfill remains disabled.
+The parent of `--database` is the data root. `--buffer-mb` and `--segment-mb` default to automatic sizing; a positive value forces an explicit size. Queue and time limits can be changed with `--queue-capacity` and `--flush-seconds`. All currently tradable instruments and all three Binance markets are enabled by default. Aggregate-trade REST backfill remains disabled.
 
 Segments use the following local and S3 layout:
 

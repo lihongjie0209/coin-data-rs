@@ -58,6 +58,7 @@ impl Writer {
         exchange: String,
         capacity: usize,
         buffer_bytes: usize,
+        segment_bytes: usize,
         flush_interval: Duration,
         metrics: Arc<Metrics>,
     ) -> Result<(Self, mpsc::UnboundedReceiver<Segment>)> {
@@ -78,6 +79,7 @@ impl Writer {
             exchange: exchange.clone(),
             capacity,
             buffer_bytes,
+            segment_bytes,
             flush_interval,
             metrics: Arc::clone(&metrics),
             buffered_bytes: Arc::clone(&buffered_bytes),
@@ -92,6 +94,7 @@ impl Writer {
             exchange: exchange.clone(),
             capacity,
             buffer_bytes,
+            segment_bytes,
             flush_interval,
             metrics: Arc::clone(&metrics),
             buffered_bytes: Arc::clone(&buffered_bytes),
@@ -106,6 +109,7 @@ impl Writer {
             exchange: exchange.clone(),
             capacity,
             buffer_bytes,
+            segment_bytes,
             flush_interval,
             metrics: Arc::clone(&metrics),
             buffered_bytes: Arc::clone(&buffered_bytes),
@@ -195,6 +199,7 @@ struct WorkerOptions {
     exchange: String,
     capacity: usize,
     buffer_bytes: usize,
+    segment_bytes: usize,
     flush_interval: Duration,
     metrics: Arc<Metrics>,
     buffered_bytes: Arc<AtomicU64>,
@@ -266,6 +271,15 @@ fn worker_run(mut receiver: mpsc::Receiver<Command>, options: WorkerOptions) -> 
                         });
                     table.bytes = table.bytes.saturating_add(bytes);
                     table.records.push(record);
+                }
+                let full_tables = state
+                    .tables
+                    .iter()
+                    .filter(|(_, table)| table.bytes >= options.segment_bytes)
+                    .map(|(name, _)| *name)
+                    .collect::<Vec<_>>();
+                for table in full_tables {
+                    flush_table(&mut state, &options, table)?;
                 }
                 while state.buffered_bytes >= options.buffer_bytes {
                     flush_largest(&mut state, &options)?;

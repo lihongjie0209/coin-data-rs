@@ -24,12 +24,15 @@ async fn main() -> Result<()> {
         .init();
 
     let root_config = Config::parse();
+    let (buffer_mb, segment_mb) = root_config.buffer_sizes()?;
+    tracing::info!(buffer_mb, segment_mb, "Parquet buffering configured");
     let metrics = Arc::new(Metrics::default());
     let (writer, completed_segments) = Writer::start(
         root_config.database.clone(),
         root_config.exchange.as_str().to_owned(),
         root_config.queue_capacity,
-        root_config.buffer_mb.saturating_mul(1_024 * 1_024),
+        buffer_mb.saturating_mul(1_024 * 1_024),
+        segment_mb.saturating_mul(1_024 * 1_024),
         root_config.flush_interval(),
         Arc::clone(&metrics),
     )?;
