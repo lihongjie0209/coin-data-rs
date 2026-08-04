@@ -22,7 +22,7 @@ pub enum Exchange {
     Bybit,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, ValueEnum)]
 pub enum Market {
     Spot,
     Usdm,
@@ -79,11 +79,19 @@ pub struct Config {
     rest_url: Option<String>,
     #[arg(long, default_value = "data/market.duckdb")]
     pub database: PathBuf,
-    #[arg(long, default_value_t = 100_000)]
-    pub batch_size: usize,
     #[arg(long, default_value_t = 20_000)]
     pub queue_capacity: usize,
-    #[arg(long, default_value_t = 1)]
+    #[arg(
+        long,
+        default_value_t = 100,
+        help = "in-memory buffer budget per market in MiB"
+    )]
+    pub buffer_mb: usize,
+    #[arg(
+        long,
+        default_value_t = 30,
+        help = "maximum seconds before buffered records are flushed"
+    )]
     flush_seconds: u64,
     #[arg(long, default_value = "127.0.0.1:8081")]
     pub api_address: String,
@@ -126,10 +134,10 @@ impl Config {
         if symbols.is_empty() || streams.is_empty() {
             bail!("symbols and streams must not be empty");
         }
-        NonZeroUsize::new(self.batch_size)
-            .ok_or_else(|| anyhow::anyhow!("batch size must be positive"))?;
         NonZeroUsize::new(self.queue_capacity)
             .ok_or_else(|| anyhow::anyhow!("queue capacity must be positive"))?;
+        NonZeroUsize::new(self.buffer_mb)
+            .ok_or_else(|| anyhow::anyhow!("buffer size must be positive"))?;
         if self.min_retention_hours == 0 || self.max_retention_hours < self.min_retention_hours {
             bail!("retention must keep at least 1 hour and max must be >= min");
         }

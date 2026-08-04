@@ -132,7 +132,7 @@ async fn process_payloads(
                 metrics
                     .parsed_records
                     .fetch_add(records.len() as u64, std::sync::atomic::Ordering::Relaxed);
-                writer.records(records).await?;
+                writer.records(market, records).await?;
             }
             Ok(_) => {
                 if let Ok(control) = serde_json::from_slice::<serde_json::Value>(&payload)

@@ -88,7 +88,7 @@ impl OpenInterestPoller {
             }
         }
         let count = records.len();
-        self.writer.records(records).await?;
+        self.writer.records(self.market, records).await?;
         tracing::info!(count, "open interest snapshot collected");
         Ok(())
     }

@@ -52,7 +52,7 @@ impl TelegramNotifier {
         let disk_total = fs2::total_space(report.data_directory).unwrap_or_default();
         let disk_available = fs2::available_space(report.data_directory).unwrap_or_default();
         let mut text = format!(
-            "DuckDB {}\ndataset: {}\nhour: {}\nfiles: {}\ndata: {}\nelapsed: {:.1}s\nrecords: received={} parsed={} written={} dropped={} errors={} reconnects={}\nwriter queue: current={} peak={}\nlast message: {}\nload1: {load}\nmemory: {} / {}\ndisk: {} free / {}",
+            "Parquet {}\ndataset: {}\nhour: {}\nfiles: {}\ndata: {}\nelapsed: {:.1}s\nrecords: received={} parsed={} written={} dropped={} errors={} reconnects={}\nwriter queue: current={} peak={}\nlast message: {}\nload1: {load}\nmemory: {} / {}\ndisk: {} free / {}",
             report.status,
             self.dataset,
             report.hour,

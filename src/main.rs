@@ -25,11 +25,11 @@ async fn main() -> Result<()> {
 
     let root_config = Config::parse();
     let metrics = Arc::new(Metrics::default());
-    let (writer, closed_databases) = Writer::start(
+    let (writer, completed_segments) = Writer::start(
         root_config.database.clone(),
         root_config.exchange.as_str().to_owned(),
         root_config.queue_capacity,
-        root_config.batch_size,
+        root_config.buffer_mb.saturating_mul(1_024 * 1_024),
         root_config.flush_interval(),
         Arc::clone(&metrics),
     )?;
@@ -38,7 +38,7 @@ async fn main() -> Result<()> {
         root_config.exchange.as_str().to_owned(),
     );
     let archiver = Arc::new(Archiver::new(&root_config, writer.clone(), notifier).await);
-    Arc::clone(&archiver).spawn(closed_databases);
+    Arc::clone(&archiver).spawn(completed_segments);
     let mut datasets = BTreeMap::new();
     for config in root_config.dataset_configs() {
         let name = config.market.as_str().to_owned();

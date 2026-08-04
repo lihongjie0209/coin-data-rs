@@ -1,10 +1,9 @@
 use anyhow::{Context, Result};
 use chrono::{DateTime, TimeZone, Utc};
-use duckdb::types::{Decimal, Value as DuckValue};
 use serde_json::Value;
 
 use crate::{
-    model::{Record, text, timestamp},
+    model::{Record, Value as DataValue, decimal as data_decimal, text, timestamp},
     parser,
 };
 
@@ -71,7 +70,7 @@ fn parse_depth(data: &Value, received: DateTime<Utc>, source: &str) -> Result<Ve
     }])
 }
 
-fn json_array(value: &Value, key: &str) -> Result<DuckValue> {
+fn json_array(value: &Value, key: &str) -> Result<DataValue> {
     let array = value
         .get(key)
         .and_then(Value::as_array)
@@ -241,13 +240,13 @@ fn string<'a>(value: &'a Value, key: &str) -> &'a str {
     value.get(key).and_then(Value::as_str).unwrap_or_default()
 }
 
-fn decimal(value: &Value, key: &str) -> DuckValue {
+fn decimal(value: &Value, key: &str) -> DataValue {
     decimal_value(string(value, key))
 }
 
-fn decimal_value(raw: &str) -> DuckValue {
+fn decimal_value(raw: &str) -> DataValue {
     if raw.is_empty() {
-        return DuckValue::Null;
+        return DataValue::Null;
     }
     let (negative, unsigned) = raw
         .strip_prefix('-')
@@ -261,33 +260,32 @@ fn decimal_value(raw: &str) -> DuckValue {
         18usize.saturating_sub(fraction.len()),
     ));
     let Some(scaled) = digits.parse::<i128>().ok() else {
-        return DuckValue::Null;
+        return DataValue::Null;
     };
-    Decimal::new(38, 18, if negative { -scaled } else { scaled })
-        .map_or(DuckValue::Null, DuckValue::Decimal)
+    data_decimal(if negative { -scaled } else { scaled })
 }
 
-fn uint(value: &Value, key: &str) -> DuckValue {
+fn uint(value: &Value, key: &str) -> DataValue {
     let number = value
         .get(key)
         .and_then(|value| value.as_u64().or_else(|| value.as_str()?.parse().ok()))
         .unwrap_or_default();
-    DuckValue::UBigInt(number)
+    DataValue::U64(number)
 }
 
-fn integer(value: &Value, key: &str) -> DuckValue {
+fn integer(value: &Value, key: &str) -> DataValue {
     let number = value
         .get(key)
         .and_then(|value| value.as_i64().or_else(|| value.as_str()?.parse().ok()))
         .unwrap_or_default();
-    DuckValue::BigInt(number)
+    DataValue::I64(number)
 }
 
-fn boolean(value: &Value, key: &str) -> DuckValue {
-    DuckValue::Boolean(value.get(key).and_then(Value::as_bool).unwrap_or(false))
+fn boolean(value: &Value, key: &str) -> DataValue {
+    DataValue::Boolean(value.get(key).and_then(Value::as_bool).unwrap_or(false))
 }
 
-fn millis(value: &Value, key: &str, fallback: DateTime<Utc>) -> DuckValue {
+fn millis(value: &Value, key: &str, fallback: DateTime<Utc>) -> DataValue {
     let raw = value
         .get(key)
         .and_then(|value| value.as_i64().or_else(|| value.as_str()?.parse().ok()));

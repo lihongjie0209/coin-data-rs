@@ -30,7 +30,6 @@ pub fn router(state: ApiState) -> Router {
         .route("/healthz", get(health))
         .route("/v1/runtime", get(runtime))
         .route("/v1/stats", get(stats))
-        .route("/v1/sql", post(sql))
         .route("/v1/archive", post(archive))
         .with_state(state)
 }
@@ -64,26 +63,8 @@ async fn stats(State(state): State<ApiState>) -> Result<Json<Value>, ApiError> {
     })))
 }
 
-#[derive(Deserialize)]
-struct SQLRequest {
-    #[serde(default = "default_market")]
-    market: String,
-    sql: String,
-}
-
 fn default_market() -> String {
     "spot".to_owned()
-}
-
-async fn sql(
-    State(state): State<ApiState>,
-    Json(request): Json<SQLRequest>,
-) -> Result<Json<Value>, ApiError> {
-    let dataset = state
-        .datasets
-        .get(&request.market)
-        .ok_or_else(|| anyhow::anyhow!("unknown market {}", request.market))?;
-    Ok(Json(dataset.writer.query(request.sql).await?))
 }
 
 #[derive(Deserialize)]

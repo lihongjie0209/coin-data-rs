@@ -18,18 +18,15 @@ jobs:
             target: aarch64-unknown-linux-gnu
     runs-on: ${{ matrix.runner }}
     container: ubuntu:20.04
-    env:
-      DUCKDB_DOWNLOAD_LIB: '1'
     steps:
       - name: Install build tools
         run: apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y build-essential ca-certificates curl git
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - run: cargo build --release --locked
+      - run: cargo build --release --bins --locked
       - name: Package
         run: |
-          cp target/release/deps/libduckdb.so target/release/libduckdb.so
-          tar -C target/release -czf coin-data-rs-${{ matrix.target }}.tar.gz coin-data-rs libduckdb.so
+          tar -C target/release -czf coin-data-rs-${{ matrix.target }}.tar.gz coin-data-rs parquet-bench
       - uses: softprops/action-gh-release@v2
         with:
           files: coin-data-rs-${{ matrix.target }}.tar.gz

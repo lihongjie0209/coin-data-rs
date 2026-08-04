@@ -1,55 +1,55 @@
 use std::{
-    collections::HashSet,
+    collections::HashMap,
     path::{Path, PathBuf},
     sync::{
-        Arc, RwLock,
-        atomic::{AtomicI64, Ordering},
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result};
-use chrono::{DateTime, Datelike, Timelike, Utc};
+use chrono::{DateTime, Timelike, Utc};
 use tokio::sync::{mpsc, oneshot};
 
-use crate::{model::Record, runtime::Metrics, storage::Storage};
+use crate::{
+    config::Market,
+    model::Record,
+    parquet_store::{Segment, write_segment},
+    runtime::Metrics,
+};
 
-pub enum Command {
+enum Command {
     Records(Vec<Record>),
-    Flush,
-    Rotate(DateTime<Utc>),
-    Stats(oneshot::Sender<Result<serde_json::Value>>),
-    Query {
-        sql: String,
-        response: oneshot::Sender<Result<serde_json::Value>>,
-    },
-}
-
-#[derive(Debug, Clone)]
-pub struct ClosedDatabase {
-    pub hour: DateTime<Utc>,
-    pub path: PathBuf,
+    Tick,
+    Flush(oneshot::Sender<Result<()>>),
 }
 
 #[derive(Clone)]
 pub struct Writer {
-    sender: mpsc::Sender<Command>,
+    spot: mpsc::Sender<Command>,
+    usdm: mpsc::Sender<Command>,
+    coinm: mpsc::Sender<Command>,
     metrics: Arc<Metrics>,
     directory: PathBuf,
     exchange: String,
-    active_hour_timestamp: Arc<AtomicI64>,
-    checkpointing: Arc<RwLock<HashSet<PathBuf>>>,
+    buffered_bytes: Arc<AtomicU64>,
+    parquet_segments: Arc<AtomicU64>,
+    parquet_bytes: Arc<AtomicU64>,
 }
 
-struct RotationState {
-    checkpoint_sender: std::sync::mpsc::Sender<CheckpointJob>,
-    active_hour_timestamp: Arc<AtomicI64>,
-    checkpointing: Arc<RwLock<HashSet<PathBuf>>>,
+struct WorkerState {
+    market: Market,
+    hour: DateTime<Utc>,
+    sequence: u64,
+    tables: HashMap<&'static str, BufferedTable>,
+    buffered_bytes: usize,
 }
 
-struct CheckpointJob {
-    closed: ClosedDatabase,
-    storage: Storage,
+struct BufferedTable {
+    records: Vec<Record>,
+    bytes: usize,
+    first_seen: Instant,
 }
 
 impl Writer {
@@ -57,115 +57,114 @@ impl Writer {
         database: PathBuf,
         exchange: String,
         capacity: usize,
-        batch_size: usize,
+        buffer_bytes: usize,
         flush_interval: Duration,
         metrics: Arc<Metrics>,
-    ) -> Result<(Self, mpsc::UnboundedReceiver<ClosedDatabase>)> {
+    ) -> Result<(Self, mpsc::UnboundedReceiver<Segment>)> {
         let directory = database
             .parent()
             .unwrap_or_else(|| Path::new("."))
-            .join(&exchange);
-        std::fs::create_dir_all(&directory).context("create hourly database directory")?;
-        let hour = floor_hour(Utc::now())?;
-        prepare_database(&hourly_path(&directory, hour))?;
-        prepare_database(&hourly_path(&directory, hour + chrono::Duration::hours(1)))?;
-
-        let (sender, receiver) = mpsc::channel(capacity);
-        let (closed_sender, closed_receiver) = mpsc::unbounded_channel();
-        let (checkpoint_sender, checkpoint_receiver) = std::sync::mpsc::channel();
-        let active_hour_timestamp = Arc::new(AtomicI64::new(hour.timestamp()));
-        let checkpointing = Arc::new(RwLock::new(HashSet::new()));
-        let checkpointing_worker = Arc::clone(&checkpointing);
-        std::thread::Builder::new()
-            .name("duckdb-checkpoint".to_owned())
-            .spawn(move || {
-                checkpoint_run(checkpoint_receiver, closed_sender, &checkpointing_worker);
-            })
-            .context("start checkpoint worker")?;
-        let run_directory = directory.clone();
-        let run_metrics = Arc::clone(&metrics);
-        let rotation = RotationState {
-            checkpoint_sender,
-            active_hour_timestamp: Arc::clone(&active_hour_timestamp),
-            checkpointing: Arc::clone(&checkpointing),
-        };
-        tokio::task::spawn_blocking(move || {
-            if let Err(error) = run(
-                run_directory,
-                hour,
-                receiver,
-                batch_size,
-                &run_metrics,
-                rotation,
-            ) {
-                tracing::error!(error = %format!("{error:#}"), "database writer stopped");
-            }
-        });
-
-        let flush_sender = sender.clone();
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(flush_interval);
-            interval.tick().await;
-            loop {
-                interval.tick().await;
-                if flush_sender.send(Command::Flush).await.is_err() {
-                    break;
-                }
-            }
-        });
-        let rotate_sender = sender.clone();
-        tokio::spawn(async move {
-            loop {
-                let now = Utc::now();
-                let Ok(current) = floor_hour(now) else { return };
-                let next = current + chrono::Duration::hours(1);
-                let wait = (next - now).to_std().unwrap_or_default();
-                tokio::time::sleep(wait).await;
-                if rotate_sender.send(Command::Rotate(next)).await.is_err() {
-                    return;
-                }
-            }
-        });
-
+            .to_path_buf();
+        std::fs::create_dir_all(directory.join(&exchange))
+            .context("create Parquet data directory")?;
+        let (segment_sender, segment_receiver) = mpsc::unbounded_channel();
+        let buffered_bytes = Arc::new(AtomicU64::new(0));
+        let parquet_segments = Arc::new(AtomicU64::new(0));
+        let parquet_bytes = Arc::new(AtomicU64::new(0));
+        let encoder_lock = Arc::new(Mutex::new(()));
+        let spot = start_worker(WorkerOptions {
+            market: Market::Spot,
+            directory: directory.clone(),
+            exchange: exchange.clone(),
+            capacity,
+            buffer_bytes,
+            flush_interval,
+            metrics: Arc::clone(&metrics),
+            buffered_bytes: Arc::clone(&buffered_bytes),
+            parquet_segments: Arc::clone(&parquet_segments),
+            parquet_bytes: Arc::clone(&parquet_bytes),
+            segment_sender: segment_sender.clone(),
+            encoder_lock: Arc::clone(&encoder_lock),
+        })?;
+        let usdm = start_worker(WorkerOptions {
+            market: Market::Usdm,
+            directory: directory.clone(),
+            exchange: exchange.clone(),
+            capacity,
+            buffer_bytes,
+            flush_interval,
+            metrics: Arc::clone(&metrics),
+            buffered_bytes: Arc::clone(&buffered_bytes),
+            parquet_segments: Arc::clone(&parquet_segments),
+            parquet_bytes: Arc::clone(&parquet_bytes),
+            segment_sender: segment_sender.clone(),
+            encoder_lock: Arc::clone(&encoder_lock),
+        })?;
+        let coinm = start_worker(WorkerOptions {
+            market: Market::Coinm,
+            directory: directory.clone(),
+            exchange: exchange.clone(),
+            capacity,
+            buffer_bytes,
+            flush_interval,
+            metrics: Arc::clone(&metrics),
+            buffered_bytes: Arc::clone(&buffered_bytes),
+            parquet_segments: Arc::clone(&parquet_segments),
+            parquet_bytes: Arc::clone(&parquet_bytes),
+            segment_sender,
+            encoder_lock,
+        })?;
         Ok((
             Self {
-                sender,
+                spot,
+                usdm,
+                coinm,
                 metrics,
                 directory,
                 exchange,
-                active_hour_timestamp,
-                checkpointing,
+                buffered_bytes,
+                parquet_segments,
+                parquet_bytes,
             },
-            closed_receiver,
+            segment_receiver,
         ))
     }
 
-    pub async fn records(&self, records: Vec<Record>) -> Result<()> {
+    pub async fn records(&self, market: Market, records: Vec<Record>) -> Result<()> {
+        let sender = self.sender(market);
         self.observe_queue();
-        let result = self
-            .sender
+        sender
             .send(Command::Records(records))
             .await
-            .context("database writer stopped");
+            .context("Parquet writer stopped")?;
         self.observe_queue();
-        result
+        Ok(())
+    }
+
+    pub async fn flush(&self) -> Result<()> {
+        for sender in [&self.spot, &self.usdm, &self.coinm] {
+            let (response, result) = oneshot::channel();
+            sender
+                .send(Command::Flush(response))
+                .await
+                .context("Parquet writer stopped")?;
+            result
+                .await
+                .context("Parquet writer dropped flush response")??;
+        }
+        Ok(())
     }
 
     pub async fn stats(&self) -> Result<serde_json::Value> {
-        let (response, result) = oneshot::channel();
-        self.sender.send(Command::Stats(response)).await?;
-        result.await.context("database writer dropped response")?
+        Ok(serde_json::json!({
+            "format": "parquet_segments",
+            "buffered_bytes": self.buffered_bytes.load(Ordering::Relaxed),
+            "segments": self.parquet_segments.load(Ordering::Relaxed),
+            "parquet_bytes": self.parquet_bytes.load(Ordering::Relaxed),
+            "directory": self.directory.join(&self.exchange),
+        }))
     }
 
-    pub async fn query(&self, sql: String) -> Result<serde_json::Value> {
-        let (response, result) = oneshot::channel();
-        self.sender.send(Command::Query { sql, response }).await?;
-        result.await.context("database writer dropped response")?
-    }
-
-    pub fn database_path(&self, hour: DateTime<Utc>) -> PathBuf {
-        hourly_path(&self.directory, hour)
-    }
     pub fn directory(&self) -> &Path {
         &self.directory
     }
@@ -173,213 +172,196 @@ impl Writer {
         &self.exchange
     }
 
-    pub fn active_hour(&self) -> Result<DateTime<Utc>> {
-        DateTime::from_timestamp(self.active_hour_timestamp.load(Ordering::Acquire), 0)
-            .context("invalid active database hour")
-    }
-
-    pub fn is_archive_ready(&self, hour: DateTime<Utc>) -> Result<bool> {
-        if hour >= self.active_hour()? {
-            return Ok(false);
+    fn sender(&self, market: Market) -> &mpsc::Sender<Command> {
+        match market {
+            Market::Spot => &self.spot,
+            Market::Usdm => &self.usdm,
+            Market::Coinm => &self.coinm,
         }
-        let path = self.database_path(hour);
-        if path.with_extension("duckdb.wal").exists() {
-            return Ok(false);
-        }
-        let checkpointing = self
-            .checkpointing
-            .read()
-            .map_err(|_| anyhow::anyhow!("checkpoint state lock poisoned"))?;
-        Ok(!checkpointing.contains(&path))
     }
 
     fn observe_queue(&self) {
-        let used = self
-            .sender
-            .max_capacity()
-            .saturating_sub(self.sender.capacity());
+        let used = [&self.spot, &self.usdm, &self.coinm]
+            .iter()
+            .map(|sender| sender.max_capacity().saturating_sub(sender.capacity()))
+            .sum::<usize>();
         self.metrics.observe_writer_queue(used as u64);
     }
 }
 
-fn run(
+struct WorkerOptions {
+    market: Market,
     directory: PathBuf,
-    mut hour: DateTime<Utc>,
-    mut receiver: mpsc::Receiver<Command>,
-    batch_size: usize,
-    metrics: &Metrics,
-    rotation: RotationState,
-) -> Result<()> {
-    let mut storage = Storage::open_existing(&hourly_path(&directory, hour))?;
-    let mut pending = Vec::with_capacity(batch_size);
+    exchange: String,
+    capacity: usize,
+    buffer_bytes: usize,
+    flush_interval: Duration,
+    metrics: Arc<Metrics>,
+    buffered_bytes: Arc<AtomicU64>,
+    parquet_segments: Arc<AtomicU64>,
+    parquet_bytes: Arc<AtomicU64>,
+    segment_sender: mpsc::UnboundedSender<Segment>,
+    encoder_lock: Arc<Mutex<()>>,
+}
+
+fn start_worker(options: WorkerOptions) -> Result<mpsc::Sender<Command>> {
+    let (sender, receiver) = mpsc::channel(options.capacity);
+    let flush_sender = sender.clone();
+    let flush_interval = options.flush_interval;
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(flush_interval);
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            if flush_sender.send(Command::Tick).await.is_err() {
+                return;
+            }
+        }
+    });
+    std::thread::Builder::new()
+        .name(format!("parquet-{}", options.market.as_str()))
+        .spawn(move || {
+            if let Err(error) = worker_run(receiver, options) {
+                tracing::error!(error = %format!("{error:#}"), "Parquet writer stopped");
+            }
+        })
+        .context("start Parquet writer thread")?;
+    Ok(sender)
+}
+
+fn worker_run(mut receiver: mpsc::Receiver<Command>, options: WorkerOptions) -> Result<()> {
+    let mut state = WorkerState {
+        market: options.market,
+        hour: floor_hour(Utc::now())?,
+        sequence: u64::try_from(Utc::now().timestamp_micros()).unwrap_or_default(),
+        tables: HashMap::new(),
+        buffered_bytes: 0,
+    };
     while let Some(command) = receiver.blocking_recv() {
+        let current_hour = floor_hour(Utc::now())?;
+        if current_hour > state.hour {
+            flush_all(&mut state, &options)?;
+            state.hour = current_hour;
+        }
         match command {
-            Command::Records(mut records) => {
-                pending.append(&mut records);
-                if pending.len() >= batch_size {
-                    flush(&mut storage, &mut pending, batch_size, metrics)?;
+            Command::Records(records) => {
+                for record in records {
+                    let bytes = record
+                        .values
+                        .iter()
+                        .map(|value| value.estimated_bytes())
+                        .sum::<usize>()
+                        + 16;
+                    state.buffered_bytes = state.buffered_bytes.saturating_add(bytes);
+                    options
+                        .buffered_bytes
+                        .fetch_add(bytes as u64, Ordering::Relaxed);
+                    let table = state
+                        .tables
+                        .entry(record.table)
+                        .or_insert_with(|| BufferedTable {
+                            records: Vec::new(),
+                            bytes: 0,
+                            first_seen: Instant::now(),
+                        });
+                    table.bytes = table.bytes.saturating_add(bytes);
+                    table.records.push(record);
+                }
+                while state.buffered_bytes >= options.buffer_bytes {
+                    flush_largest(&mut state, &options)?;
                 }
             }
-            Command::Flush => flush(&mut storage, &mut pending, batch_size, metrics)?,
-            Command::Rotate(next_hour) => {
-                if next_hour <= hour {
-                    continue;
+            Command::Tick => flush_expired(&mut state, &options)?,
+            Command::Flush(response) => {
+                if let Err(error) = flush_all(&mut state, &options) {
+                    let _ = response.send(Err(anyhow::anyhow!(format!("{error:#}"))));
+                    return Err(error);
                 }
-                flush(&mut storage, &mut pending, batch_size, metrics)?;
-                let closed = ClosedDatabase {
-                    hour,
-                    path: hourly_path(&directory, hour),
-                };
-                rotation
-                    .checkpointing
-                    .write()
-                    .map_err(|_| anyhow::anyhow!("checkpoint state lock poisoned"))?
-                    .insert(closed.path.clone());
-                prepare_database(&hourly_path(&directory, next_hour))?;
-                prepare_database(&hourly_path(
-                    &directory,
-                    next_hour + chrono::Duration::hours(1),
-                ))?;
-                let next_storage = Storage::open_existing(&hourly_path(&directory, next_hour))?;
-                let closed_storage = std::mem::replace(&mut storage, next_storage);
-                hour = next_hour;
-                rotation
-                    .active_hour_timestamp
-                    .store(hour.timestamp(), Ordering::Release);
-                rotation
-                    .checkpoint_sender
-                    .send(CheckpointJob {
-                        closed,
-                        storage: closed_storage,
-                    })
-                    .map_err(|_| anyhow::anyhow!("checkpoint worker stopped"))?;
-            }
-            Command::Stats(response) => {
-                flush(&mut storage, &mut pending, batch_size, metrics)?;
-                let mut stats = storage.stats()?;
-                if let Some(object) = stats.as_object_mut() {
-                    object.insert("hour".to_owned(), hour.to_rfc3339().into());
-                    object.insert(
-                        "path".to_owned(),
-                        hourly_path(&directory, hour).display().to_string().into(),
-                    );
-                }
-                let _ = response.send(Ok(stats));
-            }
-            Command::Query { sql, response } => {
-                flush(&mut storage, &mut pending, batch_size, metrics)?;
-                let _ = response.send(storage.query_json(&sql));
+                let _ = response.send(Ok(()));
             }
         }
     }
-    flush(&mut storage, &mut pending, batch_size, metrics)
+    flush_all(&mut state, &options)
 }
 
-fn checkpoint_run(
-    receiver: std::sync::mpsc::Receiver<CheckpointJob>,
-    closed_sender: mpsc::UnboundedSender<ClosedDatabase>,
-    checkpointing: &RwLock<HashSet<PathBuf>>,
-) {
-    while let Ok(job) = receiver.recv() {
-        let CheckpointJob { closed, storage } = job;
-        let result = storage.checkpoint();
-        drop(storage);
-        if let Ok(mut paths) = checkpointing.write() {
-            paths.remove(&closed.path);
-        }
-        match result {
-            Ok(()) => {
-                let _ = closed_sender.send(closed);
-            }
-            Err(error) => {
-                tracing::error!(
-                    path = %closed.path.display(),
-                    error = %format!("{error:#}"),
-                    "background checkpoint failed"
-                );
-            }
-        }
-    }
-}
-
-fn flush(
-    storage: &mut Storage,
-    pending: &mut Vec<Record>,
-    batch_size: usize,
-    metrics: &Metrics,
-) -> Result<()> {
-    let written = storage.insert(pending)?;
-    metrics
-        .written_records
-        .fetch_add(written as u64, std::sync::atomic::Ordering::Relaxed);
-    pending.clear();
-    if pending.capacity() > batch_size.saturating_mul(2) {
-        pending.shrink_to(batch_size);
+fn flush_largest(state: &mut WorkerState, options: &WorkerOptions) -> Result<()> {
+    let table = state
+        .tables
+        .iter()
+        .max_by_key(|(_, table)| table.bytes)
+        .map(|(name, _)| *name);
+    if let Some(table) = table {
+        flush_table(state, options, table)?;
     }
     Ok(())
 }
 
-fn prepare_database(path: &Path) -> Result<()> {
-    if !path.exists() {
-        drop(Storage::open(path)?);
+fn flush_expired(state: &mut WorkerState, options: &WorkerOptions) -> Result<()> {
+    let expired = state
+        .tables
+        .iter()
+        .filter(|(_, table)| table.first_seen.elapsed() >= options.flush_interval)
+        .map(|(name, _)| *name)
+        .collect::<Vec<_>>();
+    for table in expired {
+        flush_table(state, options, table)?;
     }
+    Ok(())
+}
+
+fn flush_all(state: &mut WorkerState, options: &WorkerOptions) -> Result<()> {
+    let tables = state.tables.keys().copied().collect::<Vec<_>>();
+    for table in tables {
+        flush_table(state, options, table)?;
+    }
+    Ok(())
+}
+
+fn flush_table(
+    state: &mut WorkerState,
+    options: &WorkerOptions,
+    table: &'static str,
+) -> Result<()> {
+    let Some(buffer) = state.tables.remove(table) else {
+        return Ok(());
+    };
+    if buffer.records.is_empty() {
+        return Ok(());
+    }
+    state.sequence = state.sequence.wrapping_add(1);
+    let _encoder = options
+        .encoder_lock
+        .lock()
+        .map_err(|_| anyhow::anyhow!("Parquet encoder lock poisoned"))?;
+    let segment = write_segment(
+        &options.directory,
+        &options.exchange,
+        state.market,
+        state.hour,
+        state.sequence,
+        table,
+        &buffer.records,
+    )?;
+    state.buffered_bytes = state.buffered_bytes.saturating_sub(buffer.bytes);
+    options
+        .buffered_bytes
+        .fetch_sub(buffer.bytes as u64, Ordering::Relaxed);
+    options
+        .metrics
+        .written_records
+        .fetch_add(segment.rows as u64, Ordering::Relaxed);
+    options.parquet_segments.fetch_add(1, Ordering::Relaxed);
+    options
+        .parquet_bytes
+        .fetch_add(segment.bytes, Ordering::Relaxed);
+    let _ = options.segment_sender.send(segment);
     Ok(())
 }
 
 pub fn floor_hour(value: DateTime<Utc>) -> Result<DateTime<Utc>> {
     value
         .with_minute(0)
-        .and_then(|v| v.with_second(0))
-        .and_then(|v| v.with_nanosecond(0))
+        .and_then(|value| value.with_second(0))
+        .and_then(|value| value.with_nanosecond(0))
         .context("invalid UTC hour")
-}
-
-pub fn hourly_path(directory: &Path, hour: DateTime<Utc>) -> PathBuf {
-    directory
-        .join(format!(
-            "{:04}-{:02}-{:02}",
-            hour.year(),
-            hour.month(),
-            hour.day()
-        ))
-        .join(format!("{:02}.duckdb", hour.hour()))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use tempfile::tempdir;
-
-    #[tokio::test]
-    async fn rotation_closes_current_and_prepares_following_hour() -> Result<()> {
-        let temporary = tempdir()?;
-        let database = temporary.path().join("market.duckdb");
-        let metrics = Arc::new(Metrics::default());
-        let (writer, mut closed) = Writer::start(
-            database,
-            "binance".to_owned(),
-            10,
-            10,
-            Duration::from_secs(60),
-            metrics,
-        )?;
-        let current = floor_hour(Utc::now())?;
-        let next = current + chrono::Duration::hours(1);
-        writer.sender.send(Command::Rotate(next)).await?;
-        let item = tokio::time::timeout(Duration::from_secs(5), closed.recv())
-            .await?
-            .context("rotation notification missing")?;
-        assert_eq!(item.hour, current);
-        assert_eq!(writer.active_hour()?, next);
-        assert!(writer.is_archive_ready(current)?);
-        assert!(!writer.is_archive_ready(next)?);
-        assert!(item.path.is_file());
-        assert!(writer.database_path(next).is_file());
-        assert!(
-            writer
-                .database_path(next + chrono::Duration::hours(1))
-                .is_file()
-        );
-        Ok(())
-    }
 }

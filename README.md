@@ -1,29 +1,25 @@
 # coin-data-rs
 
-Rust implementation of a Binance Spot, USDⓈ-M, and COIN-M real-time market-data collector. One process supervises all three markets and writes one DuckDB file per exchange per UTC hour. It consumes sharded WebSocket streams, stores documented fields in structured tables, and uploads each closed hourly database directly to S3.
+Rust Binance Spot, USDⓈ-M, and COIN-M real-time market-data collector. One process supervises all three markets, preserves documented fields in typed Parquet columns, and asynchronously uploads completed segments to S3.
 
-DuckDB is dynamically linked. Release archives contain the matching `libduckdb.so`; install it under `/usr/local/lib/coin-data-rs` (the systemd unit sets `LD_LIBRARY_PATH`). The server does not need GCC or a Rust toolchain.
-
-The receiver and database writer are separated by a bounded asynchronous channel. DuckDB writes run
-on one dedicated blocking thread. The following hour's database is initialized in advance; at the
-hour boundary the writer flushes and checkpoints the old file, switches to the prepared file, and
-hands the closed file to the asynchronous S3 uploader. The connection is limited to 160 MiB and the
-bounded writer queue prevents an extended database stall from exhausting host memory.
+DuckDB is not used. Spot, USD-M, and COIN-M each have a dedicated writer thread, bounded queue, and a 100 MiB in-memory budget. A market flushes when its budget is reached, after 30 seconds, or at an UTC hour boundary. Every table becomes an independently closed Parquet segment through a `.tmp` file followed by an atomic rename. S3 failures retain the local segment for retry and never block WebSocket ingestion.
 
 ## Run
 
 ```bash
-cargo run --release -- \
-  --database data/market.duckdb
+cargo run --release -- --database data/market
 ```
 
-Use `--help` for all settings. By default the process runs `spot`, `usdm`, and `coinm` together. All markets for one exchange share one hourly DuckDB file under `<database parent>/binance/YYYY-MM-DD/HH.duckdb`; the next hour is prepared in advance and the writer switches files at the UTC hour boundary. Closed files are uploaded directly to S3 as `<prefix>/binance/YYYY-MM-DD/HH.duckdb`, without a Parquet conversion step. Set `--all-markets=false --market usdm` to run one market only. The default `--symbols ALL` discovers all currently tradable instruments in each market. The desired connection count defaults to four per market and is automatically increased when Binance's 1024-stream limit requires it. USDⓈ-M high-frequency public streams and regular market streams are routed to their separate endpoints.
+The parent of `--database` is the data root. Defaults can be changed with `--buffer-mb`, `--queue-capacity`, and `--flush-seconds`. All currently tradable instruments and all three Binance markets are enabled by default. Aggregate-trade REST backfill remains disabled.
 
-Aggregate trades come only from real-time WebSocket streams; REST historical backfill is disabled.
-Futures open interest is sampled once per minute and shares a global Binance REST backoff after
-HTTP 418 or 429 responses.
+Segments use the following local and S3 layout:
 
-Uploaded hourly DuckDB files are retained locally for the current and previous hour by default. Only files with a successful upload marker are removed; active, future, and unuploaded files are never deleted. The retention and free-disk thresholds are configurable.
+```text
+<root>/binance/spot/aggregate_trades/2026-08-04/00/segment-0000000001.parquet
+<prefix>/binance/usdm/futures_depth_updates/2026-08-04/00/segment-0000000002.parquet
+```
+
+Only successfully uploaded segments receive `.uploaded` markers. The retention task removes marked segments after the configured retention period and may shorten retention when free disk falls below the threshold. Unuploaded data is never deleted.
 
 ## API
 
@@ -31,30 +27,23 @@ The API binds to `127.0.0.1:8081` by default.
 
 ```bash
 curl http://127.0.0.1:8081/healthz
+curl http://127.0.0.1:8081/v1/runtime
 curl http://127.0.0.1:8081/v1/stats
-curl -X POST http://127.0.0.1:8081/v1/sql \
-  -H 'content-type: application/json' \
-  -d '{"market":"usdm","sql":"select symbol,count(*) from futures_aggregate_trades group by symbol"}'
 curl -X POST http://127.0.0.1:8081/v1/archive \
   -H 'content-type: application/json' \
-  -d '{"market":"coinm","hour":"2026-08-03T12:00:00Z","force":true}'
+  -d '{"market":"spot","hour":"2026-08-04T00:00:00Z","force":true}'
 ```
 
-The SQL endpoint intentionally accepts arbitrary SQL and must remain private.
+Arbitrary SQL is no longer exposed because there is no embedded database. Query S3 Parquet with DuckDB, Athena, Spark, Polars, or another Parquet engine.
 
-Hourly DuckDB objects use exchange, date, and hour:
+Set `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` for manual archive success/failure reports containing file count, bytes, duration, collector counters, load, memory, and disk usage.
 
-```text
-parquet/rust/binance/2026-08-03/04.duckdb
+## Historical benchmark
+
+The release includes `parquet-bench`. It repeatedly reads historical Parquet batches and rewrites them with the production ZSTD level to measure encoding throughput without touching production files.
+
+```bash
+parquet-bench --source /path/to/history --output /tmp/parquet-bench --seconds 60
 ```
 
-The single file contains all spot, USD-M, and COIN-M tables for the hour. Market-specific `source`
-values distinguish the feeds while all structured fields remain queryable in DuckDB.
-
-Set `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` to receive a success or failure report after every
-automatic or manually triggered archive. Reports include file count, bytes, duration, collector
-counters, load average, memory, and disk usage.
-
-## Tables
-
-Spot tables include `depth_updates`, `depth_levels`, `aggregate_trades`, `trades`, `book_tickers`, `tickers`, `rolling_tickers`, `mini_tickers`, `klines`, and `average_prices`. Futures use dedicated `futures_*` tables for depth, aggregate trades, book ticker, mark/index/funding price, liquidation, open interest, mini ticker, ticker, and kline data. Raw JSON is not retained.
+Spot tables include depth updates, aggregate trades, trades, book tickers, tickers, rolling tickers, mini tickers, klines, and average prices. Futures use dedicated `futures_*` tables for depth, aggregate trades, book tickers, mark/index/funding prices, liquidations, open interest, mini tickers, tickers, and klines. Raw event envelopes are not retained.

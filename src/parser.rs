@@ -1,9 +1,8 @@
 use anyhow::{Context, Result};
 use chrono::{DateTime, TimeZone, Utc};
-use duckdb::types::{Decimal, Value as DuckValue};
 use serde_json::Value;
 
-use crate::model::{Record, text, timestamp};
+use crate::model::{Record, Value as DataValue, decimal as decimal_value, text, timestamp};
 
 pub fn parse(payload: &[u8], received: DateTime<Utc>, source: &str) -> Result<Vec<Record>> {
     let envelope: Value = serde_json::from_slice(payload).context("decode websocket event")?;
@@ -116,7 +115,7 @@ fn parse_depth(data: &Value, received: DateTime<Utc>, source: &str) -> Result<Ve
     )])
 }
 
-fn json_array(value: &Value, key: &str) -> Result<DuckValue> {
+fn json_array(value: &Value, key: &str) -> Result<DataValue> {
     let array = value
         .get(key)
         .and_then(Value::as_array)
@@ -214,13 +213,13 @@ fn parse_kline(data: &Value, received: DateTime<Utc>, source: &str) -> Record {
     )
 }
 
-fn record(table: &'static str, values: Vec<DuckValue>) -> Record {
+fn record(table: &'static str, values: Vec<DataValue>) -> Record {
     Record { table, values }
 }
 fn string<'a>(value: &'a Value, key: &str) -> &'a str {
     value.get(key).and_then(Value::as_str).unwrap_or_default()
 }
-fn decimal(value: &Value, key: &str) -> DuckValue {
+fn decimal(value: &Value, key: &str) -> DataValue {
     let raw = string(value, key);
     let (negative, unsigned) = raw
         .strip_prefix('-')
@@ -238,24 +237,24 @@ fn decimal(value: &Value, key: &str) -> DuckValue {
         .ok()
         .map(|value| if negative { -value } else { value })
         .unwrap_or_default();
-    Decimal::new(38, 18, scaled).map_or(DuckValue::Null, DuckValue::Decimal)
+    decimal_value(scaled)
 }
-fn uint(value: &Value, key: &str) -> DuckValue {
-    DuckValue::UBigInt(value.get(key).and_then(Value::as_u64).unwrap_or_default())
+fn uint(value: &Value, key: &str) -> DataValue {
+    DataValue::U64(value.get(key).and_then(Value::as_u64).unwrap_or_default())
 }
-fn integer(value: &Value, key: &str) -> DuckValue {
-    DuckValue::BigInt(value.get(key).and_then(Value::as_i64).unwrap_or_default())
+fn integer(value: &Value, key: &str) -> DataValue {
+    DataValue::I64(value.get(key).and_then(Value::as_i64).unwrap_or_default())
 }
-fn boolean(value: &Value, key: &str) -> DuckValue {
-    DuckValue::Boolean(value.get(key).and_then(Value::as_bool).unwrap_or_default())
+fn boolean(value: &Value, key: &str) -> DataValue {
+    DataValue::Boolean(value.get(key).and_then(Value::as_bool).unwrap_or_default())
 }
-fn optional_boolean(value: &Value, key: &str, default: bool) -> DuckValue {
-    DuckValue::Boolean(value.get(key).and_then(Value::as_bool).unwrap_or(default))
+fn optional_boolean(value: &Value, key: &str, default: bool) -> DataValue {
+    DataValue::Boolean(value.get(key).and_then(Value::as_bool).unwrap_or(default))
 }
-fn event_time(value: &Value, fallback: DateTime<Utc>) -> DuckValue {
+fn event_time(value: &Value, fallback: DateTime<Utc>) -> DataValue {
     millis(value, "E", fallback)
 }
-fn millis(value: &Value, key: &str, fallback: DateTime<Utc>) -> DuckValue {
+fn millis(value: &Value, key: &str, fallback: DateTime<Utc>) -> DataValue {
     let milliseconds = value.get(key).and_then(Value::as_i64).unwrap_or_default();
     let value = if milliseconds == 0 {
         fallback
