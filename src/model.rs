@@ -13,13 +13,16 @@ pub enum Value {
 
 impl Value {
     pub fn estimated_bytes(&self) -> usize {
-        match self {
-            Self::Null => 1,
-            Self::Text(value) => value.len() + 8,
-            Self::TimestampMicros(_) | Self::U64(_) | Self::I64(_) => 8,
-            Self::Decimal(_) => 16,
-            Self::Boolean(_) => 1,
-        }
+        std::mem::size_of::<Self>()
+            + match self {
+                Self::Text(value) => value.capacity(),
+                Self::Null
+                | Self::TimestampMicros(_)
+                | Self::U64(_)
+                | Self::I64(_)
+                | Self::Decimal(_)
+                | Self::Boolean(_) => 0,
+            }
     }
 }
 

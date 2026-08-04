@@ -251,7 +251,7 @@ fn worker_run(mut receiver: mpsc::Receiver<Command>, options: WorkerOptions) -> 
                         .iter()
                         .map(|value| value.estimated_bytes())
                         .sum::<usize>()
-                        + 16;
+                        + std::mem::size_of::<Record>();
                     state.buffered_bytes = state.buffered_bytes.saturating_add(bytes);
                     options
                         .buffered_bytes
