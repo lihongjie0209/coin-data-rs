@@ -42,7 +42,7 @@ pub struct Options {
     pub small_file_mb: u64,
     #[arg(long, default_value_t = 10)]
     pub settle_minutes: i64,
-    #[arg(long, default_value_t = 65_536)]
+    #[arg(long, default_value_t = 262_144)]
     pub batch_rows: usize,
     #[arg(
         long,
@@ -492,7 +492,6 @@ pub fn reorder_batch(batch: &RecordBatch) -> Result<RecordBatch> {
             values: batch.column(index).clone(),
             options: None,
         });
-        break;
     }
     let indices = lexsort_to_indices(&sort_columns, None)?;
     let columns = batch
@@ -559,18 +558,20 @@ mod tests {
     }
 
     #[test]
-    fn reorder_batch_should_sort_by_symbol_then_event_time() -> Result<()> {
+    fn reorder_batch_should_sort_by_symbol_then_available_times() -> Result<()> {
         let schema = Arc::new(Schema::new(vec![
             Field::new("symbol", DataType::Utf8, false),
             Field::new("event_time", DataType::Int64, false),
+            Field::new("received_at", DataType::Int64, false),
             Field::new("value", DataType::Int64, false),
         ]));
         let batch = RecordBatch::try_new(
             schema,
             vec![
-                Arc::new(StringArray::from(vec!["B", "A", "B", "A"])),
-                Arc::new(Int64Array::from(vec![2, 2, 1, 1])),
-                Arc::new(Int64Array::from(vec![20, 12, 10, 11])),
+                Arc::new(StringArray::from(vec!["B", "A", "B", "A", "A"])),
+                Arc::new(Int64Array::from(vec![2, 2, 1, 1, 1])),
+                Arc::new(Int64Array::from(vec![1, 2, 1, 2, 1])),
+                Arc::new(Int64Array::from(vec![20, 12, 10, 13, 11])),
             ],
         )?;
 
@@ -586,7 +587,7 @@ mod tests {
             .downcast_ref::<Int64Array>()
             .context("time column")?;
         let values = sorted
-            .column(2)
+            .column(3)
             .as_any()
             .downcast_ref::<Int64Array>()
             .context("value column")?;
@@ -602,7 +603,13 @@ mod tests {
 
         assert_eq!(
             actual,
-            vec![("A", 1, 11), ("A", 2, 12), ("B", 1, 10), ("B", 2, 20)]
+            vec![
+                ("A", 1, 11),
+                ("A", 1, 13),
+                ("A", 2, 12),
+                ("B", 1, 10),
+                ("B", 2, 20)
+            ]
         );
         Ok(())
     }

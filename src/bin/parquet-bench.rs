@@ -27,14 +27,16 @@ struct Options {
     zstd_level: i32,
     #[arg(long, default_value_t = 131_072)]
     row_group_rows: usize,
+    #[arg(long, default_value_t = 65_536)]
+    batch_rows: usize,
     #[arg(long)]
     sort_by_symbol: bool,
 }
 
 fn main() -> Result<()> {
     let options = Options::parse();
-    if options.row_group_rows == 0 {
-        bail!("row-group-rows must be positive");
+    if options.row_group_rows == 0 || options.batch_rows == 0 {
+        bail!("row-group-rows and batch-rows must be positive");
     }
     let sources = parquet_files(&options.source)?;
     if sources.is_empty() {
@@ -58,6 +60,7 @@ fn main() -> Result<()> {
                 files,
                 options.zstd_level,
                 options.row_group_rows,
+                options.batch_rows,
                 options.sort_by_symbol,
             )?;
             rows = rows.saturating_add(result.rows);
@@ -79,6 +82,7 @@ fn main() -> Result<()> {
             "output_mib_per_second": output_bytes as f64 / 1_048_576.0 / elapsed,
             "zstd_level": options.zstd_level,
             "row_group_rows": options.row_group_rows,
+            "batch_rows": options.batch_rows,
             "sort_by_symbol": options.sort_by_symbol,
         })
     );
@@ -97,12 +101,13 @@ fn rewrite(
     sequence: u64,
     zstd_level: i32,
     row_group_rows: usize,
+    batch_rows: usize,
     sort_by_symbol: bool,
 ) -> Result<RewriteResult> {
     let input = File::open(source)?;
     let builder = ParquetRecordBatchReaderBuilder::try_new(input)?;
     let schema: Arc<Schema> = builder.schema().clone();
-    let mut reader = builder.with_batch_size(65_536).build()?;
+    let mut reader = builder.with_batch_size(batch_rows).build()?;
     let path = output.join(format!("bench-{sequence:08}.parquet"));
     let properties = WriterProperties::builder()
         .set_compression(Compression::ZSTD(ZstdLevel::try_new(zstd_level)?))
