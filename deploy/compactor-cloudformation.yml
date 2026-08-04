@@ -16,6 +16,8 @@ Parameters:
 Resources:
   Repository:
     Type: AWS::ECR::Repository
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Properties:
       RepositoryName: coin-data-parquet-compactor
       ImageScanningConfiguration:
@@ -203,7 +205,7 @@ Resources:
     Properties:
       Name: coin-data-parquet-compactor-8h
       Description: Scan and compact completed Parquet partitions every eight hours
-      State: DISABLED
+      State: ENABLED
       ScheduleExpression: cron(15 0/8 * * ? *)
       ScheduleExpressionTimezone: UTC
       FlexibleTimeWindow:
