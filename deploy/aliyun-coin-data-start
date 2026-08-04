@@ -1,0 +1,31 @@
+#!/bin/sh
+set -eu
+
+metadata=http://100.100.100.200/latest
+token=$(curl -fsS -X PUT \
+  -H 'X-aliyun-ecs-metadata-token-ttl-seconds: 21600' \
+  "$metadata/api/token")
+role=$(curl -fsS \
+  -H "X-aliyun-ecs-metadata-token: $token" \
+  "$metadata/meta-data/ram/security-credentials/")
+credentials=$(curl -fsS \
+  -H "X-aliyun-ecs-metadata-token: $token" \
+  "$metadata/meta-data/ram/security-credentials/$role")
+
+export AWS_ACCESS_KEY_ID
+export AWS_SECRET_ACCESS_KEY
+export AWS_SESSION_TOKEN
+AWS_ACCESS_KEY_ID=$(printf '%s' "$credentials" | jq -er .AccessKeyId)
+AWS_SECRET_ACCESS_KEY=$(printf '%s' "$credentials" | jq -er .AccessKeySecret)
+AWS_SESSION_TOKEN=$(printf '%s' "$credentials" | jq -er .SecurityToken)
+
+exec /usr/local/bin/coin-data-rs \
+  --exchange binance \
+  --database /var/lib/coin-data-rs/market.parquet \
+  --api-address 127.0.0.1:8081 \
+  --s3-bucket coin-data-1880219608457355-sg \
+  --s3-prefix validation/aliyun \
+  --aws-region ap-southeast-1 \
+  --s3-endpoint https://s3.oss-ap-southeast-1-internal.aliyuncs.com \
+  --min-retention-hours 2 \
+  --max-retention-hours 2

@@ -7,7 +7,11 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use aws_config::{BehaviorVersion, Region};
-use aws_sdk_s3::{Client, primitives::ByteStream};
+use aws_sdk_s3::{
+    Client,
+    config::{RequestChecksumCalculation, ResponseChecksumValidation},
+    primitives::ByteStream,
+};
 use chrono::{DateTime, NaiveDateTime, Utc};
 use tokio::sync::mpsc;
 
@@ -47,7 +51,14 @@ impl Archiver {
             .await;
         let mut s3 = aws_sdk_s3::config::Builder::from(&sdk);
         if let Some(endpoint) = &config.s3_endpoint {
-            s3 = s3.endpoint_url(endpoint).force_path_style(false);
+            // S3-compatible stores such as OSS reject AWS's optional streaming
+            // checksum trailers. Keep mandatory checksums while avoiding that
+            // wire format, and use the virtual-host addressing OSS requires.
+            s3 = s3
+                .endpoint_url(endpoint)
+                .force_path_style(false)
+                .request_checksum_calculation(RequestChecksumCalculation::WhenRequired)
+                .response_checksum_validation(ResponseChecksumValidation::WhenRequired);
         }
         Self {
             writer,

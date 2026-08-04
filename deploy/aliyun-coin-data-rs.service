@@ -1,0 +1,23 @@
+[Unit]
+Description=Binance market data collector (Alibaba Cloud benchmark)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=coin-data
+Group=coin-data
+Environment=RUST_LOG=coin_data=info
+ExecStart=/usr/local/bin/aliyun-coin-data-start
+Restart=always
+RestartSec=5
+TimeoutStopSec=30
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/coin-data-rs
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
