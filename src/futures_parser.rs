@@ -12,32 +12,46 @@ use crate::{
 };
 
 pub fn parse(payload: &[u8], received: DateTime<Utc>, source: &'static str) -> Result<Vec<Record>> {
-    let (_, events) = binance_json::decode(payload)?;
-    let mut records = Vec::with_capacity(events.len());
-    for data in events {
-        records.extend(parse_event(&data, received, source)?);
-    }
-    if records.is_empty() {
-        return parser::parse(payload, received, source);
-    }
+    let mut records = Vec::new();
+    parse_into(payload, received, source, &mut records)?;
     Ok(records)
+}
+
+pub fn parse_into(
+    payload: &[u8],
+    received: DateTime<Utc>,
+    source: &'static str,
+    records: &mut Vec<Record>,
+) -> Result<()> {
+    let (_, events) = binance_json::decode(payload)?;
+    records.reserve(events.len());
+    let initial_len = records.len();
+    for data in events {
+        if let Some(record) = parse_event(&data, received, source)? {
+            records.push(record);
+        }
+    }
+    if records.len() == initial_len {
+        parser::parse_into(payload, received, source, records)?;
+    }
+    Ok(())
 }
 
 fn parse_event(
     data: &Event<'_>,
     received: DateTime<Utc>,
     source: &'static str,
-) -> Result<Vec<Record>> {
+) -> Result<Option<Record>> {
     match binance_json::string(data.e) {
-        "depthUpdate" => Ok(vec![parse_depth(data, received, source)]),
-        "aggTrade" => Ok(vec![aggregate_trade(data, received, source)]),
-        "bookTicker" => Ok(vec![book_ticker(data, received, source)]),
-        "markPriceUpdate" => Ok(vec![mark_price(data, received, source)]),
-        "forceOrder" => Ok(vec![liquidation(data, received, source)?]),
-        "24hrMiniTicker" => Ok(vec![mini_ticker(data, received, source)]),
-        "24hrTicker" => Ok(vec![ticker(data, received, source)]),
-        "kline" => Ok(vec![kline(data, received, source)?]),
-        _ => Ok(Vec::new()),
+        "depthUpdate" => Ok(Some(parse_depth(data, received, source))),
+        "aggTrade" => Ok(Some(aggregate_trade(data, received, source))),
+        "bookTicker" => Ok(Some(book_ticker(data, received, source))),
+        "markPriceUpdate" => Ok(Some(mark_price(data, received, source))),
+        "forceOrder" => Ok(Some(liquidation(data, received, source)?)),
+        "24hrMiniTicker" => Ok(Some(mini_ticker(data, received, source))),
+        "24hrTicker" => Ok(Some(ticker(data, received, source))),
+        "kline" => Ok(Some(kline(data, received, source)?)),
+        _ => Ok(None),
     }
 }
 

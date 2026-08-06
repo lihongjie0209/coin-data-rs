@@ -10,12 +10,25 @@ use crate::{
 };
 
 pub fn parse(payload: &[u8], received: DateTime<Utc>, source: &'static str) -> Result<Vec<Record>> {
-    let (stream, events) = binance_json::decode(payload)?;
-    let mut records = Vec::with_capacity(events.len());
-    for data in events {
-        records.extend(parse_event(stream, &data, received, source)?);
-    }
+    let mut records = Vec::new();
+    parse_into(payload, received, source, &mut records)?;
     Ok(records)
+}
+
+pub fn parse_into(
+    payload: &[u8],
+    received: DateTime<Utc>,
+    source: &'static str,
+    records: &mut Vec<Record>,
+) -> Result<()> {
+    let (stream, events) = binance_json::decode(payload)?;
+    records.reserve(events.len());
+    for data in events {
+        if let Some(record) = parse_event(stream, &data, received, source)? {
+            records.push(record);
+        }
+    }
+    Ok(())
 }
 
 fn parse_event(
@@ -23,10 +36,10 @@ fn parse_event(
     data: &Event<'_>,
     received: DateTime<Utc>,
     source: &'static str,
-) -> Result<Vec<Record>> {
+) -> Result<Option<Record>> {
     match binance_json::string(data.e) {
-        "depthUpdate" => Ok(vec![parse_depth(data, received, source)]),
-        "aggTrade" => Ok(vec![record(
+        "depthUpdate" => Ok(Some(parse_depth(data, received, source))),
+        "aggTrade" => Ok(Some(record(
             "aggregate_trades",
             vec![
                 event_time(data, received),
@@ -42,8 +55,8 @@ fn parse_event(
                 boolean(data.upper_m, true),
                 static_text(source),
             ],
-        )]),
-        "trade" => Ok(vec![record(
+        ))),
+        "trade" => Ok(Some(record(
             "trades",
             vec![
                 event_time(data, received),
@@ -57,9 +70,9 @@ fn parse_event(
                 boolean(data.upper_m, true),
                 static_text(source),
             ],
-        )]),
-        "kline" => Ok(vec![parse_kline(data, received, source)?]),
-        "24hrMiniTicker" => Ok(vec![record(
+        ))),
+        "kline" => Ok(Some(parse_kline(data, received, source)?)),
+        "24hrMiniTicker" => Ok(Some(record(
             "mini_tickers",
             vec![
                 event_time(data, received),
@@ -73,12 +86,12 @@ fn parse_event(
                 decimal(data.q),
                 static_text(source),
             ],
-        )]),
-        "24hrTicker" => Ok(vec![parse_ticker(data, received, source)]),
+        ))),
+        "24hrTicker" => Ok(Some(parse_ticker(data, received, source))),
         "1hTicker" | "4hTicker" | "1dTicker" => {
-            Ok(vec![parse_rolling_ticker(data, received, source)])
+            Ok(Some(parse_rolling_ticker(data, received, source)))
         }
-        "avgPrice" => Ok(vec![record(
+        "avgPrice" => Ok(Some(record(
             "average_prices",
             vec![
                 event_time(data, received),
@@ -89,8 +102,8 @@ fn parse_event(
                 millis(data.transaction_time, received),
                 static_text(source),
             ],
-        )]),
-        "" if stream.contains("@bookTicker") => Ok(vec![record(
+        ))),
+        "" if stream.contains("@bookTicker") => Ok(Some(record(
             "book_tickers",
             vec![
                 timestamp(received),
@@ -102,8 +115,8 @@ fn parse_event(
                 decimal(data.upper_a),
                 static_text(source),
             ],
-        )]),
-        _ => Ok(Vec::new()),
+        ))),
+        _ => Ok(None),
     }
 }
 

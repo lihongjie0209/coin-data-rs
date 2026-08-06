@@ -9,6 +9,60 @@ use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 use crate::{config::Market, futures_parser, parser, runtime::Metrics, writer::Writer};
 
+const METRICS_FLUSH_MESSAGES: u64 = 256;
+const METRICS_FLUSH_INTERVAL: Duration = Duration::from_secs(1);
+
+struct ReceivedMetrics<'a> {
+    metrics: &'a Metrics,
+    pending: u64,
+    latest_unix_ms: u64,
+    last_flush: std::time::Instant,
+}
+
+impl<'a> ReceivedMetrics<'a> {
+    fn new(metrics: &'a Metrics) -> Self {
+        Self {
+            metrics,
+            pending: 0,
+            latest_unix_ms: 0,
+            last_flush: std::time::Instant::now(),
+        }
+    }
+
+    fn record(&mut self, received: chrono::DateTime<Utc>) {
+        self.pending += 1;
+        self.latest_unix_ms = self
+            .latest_unix_ms
+            .max(received.timestamp_millis().max(0) as u64);
+        if self.pending >= METRICS_FLUSH_MESSAGES
+            || self.last_flush.elapsed() >= METRICS_FLUSH_INTERVAL
+        {
+            self.flush();
+        }
+    }
+
+    fn flush(&mut self) {
+        if self.pending == 0 {
+            return;
+        }
+        self.metrics
+            .received_messages
+            .fetch_add(self.pending, std::sync::atomic::Ordering::Relaxed);
+        self.metrics
+            .last_message_unix_ms
+            .fetch_max(self.latest_unix_ms, std::sync::atomic::Ordering::Relaxed);
+        self.pending = 0;
+        self.latest_unix_ms = 0;
+        self.last_flush = std::time::Instant::now();
+    }
+}
+
+impl Drop for ReceivedMetrics<'_> {
+    fn drop(&mut self) {
+        self.flush();
+    }
+}
+
 pub struct Payload {
     bytes: Bytes,
     received: chrono::DateTime<Utc>,
@@ -78,6 +132,7 @@ async fn collect(
         streams = streams.len(),
         "websocket connected"
     );
+    let mut received_metrics = ReceivedMetrics::new(metrics);
     let rotation = tokio::time::sleep(Duration::from_secs(23 * 60 * 60 + 50 * 60));
     tokio::pin!(rotation);
     loop {
@@ -99,13 +154,7 @@ async fn collect(
             _ => continue,
         };
         let received = Utc::now();
-        metrics
-            .received_messages
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        metrics.last_message_unix_ms.store(
-            received.timestamp_millis().max(0) as u64,
-            std::sync::atomic::Ordering::Relaxed,
-        );
+        received_metrics.record(received);
         payload_sender
             .send(Payload {
                 bytes: payload,
@@ -140,11 +189,18 @@ async fn process_payloads(
             payloads.push(payload);
         }
         let mut record_batch = Vec::with_capacity(payloads.len());
+        let mut parsed_records = 0_u64;
         for payload in payloads.drain(..) {
+            let initial_len = record_batch.len();
             let parsed = if market == Market::Spot {
-                parser::parse(&payload.bytes, payload.received, "binance_spot_websocket")
+                parser::parse_into(
+                    &payload.bytes,
+                    payload.received,
+                    "binance_spot_websocket",
+                    &mut record_batch,
+                )
             } else {
-                futures_parser::parse(
+                futures_parser::parse_into(
                     &payload.bytes,
                     payload.received,
                     if market == Market::Usdm {
@@ -152,16 +208,14 @@ async fn process_payloads(
                     } else {
                         "binance_coinm_websocket"
                     },
+                    &mut record_batch,
                 )
             };
             match parsed {
-                Ok(records) if !records.is_empty() => {
-                    metrics
-                        .parsed_records
-                        .fetch_add(records.len() as u64, std::sync::atomic::Ordering::Relaxed);
-                    record_batch.extend(records);
+                Ok(()) if record_batch.len() > initial_len => {
+                    parsed_records += (record_batch.len() - initial_len) as u64;
                 }
-                Ok(_) => {
+                Ok(()) => {
                     if let Ok(control) = serde_json::from_slice::<serde_json::Value>(&payload.bytes)
                         && (control.get("result").is_some() || control.get("code").is_some())
                     {
@@ -169,6 +223,7 @@ async fn process_payloads(
                     }
                 }
                 Err(error) => {
+                    record_batch.truncate(initial_len);
                     metrics
                         .parse_errors
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -176,8 +231,43 @@ async fn process_payloads(
                 }
             }
         }
+        metrics
+            .parsed_records
+            .fetch_add(parsed_records, std::sync::atomic::Ordering::Relaxed);
         if !record_batch.is_empty() {
             writer.records(market, record_batch).await?;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::Ordering;
+
+    use chrono::TimeZone;
+
+    use super::*;
+
+    #[test]
+    fn received_metrics_should_flush_pending_values_when_dropped() {
+        let metrics = Metrics::default();
+        {
+            let mut received = ReceivedMetrics::new(&metrics);
+            received.record(Utc.timestamp_millis_opt(123).single().unwrap_or_default());
+        }
+
+        assert_eq!(metrics.snapshot().received_messages, 1);
+    }
+
+    #[test]
+    fn received_metrics_should_not_move_latest_message_backwards() {
+        let metrics = Metrics::default();
+        metrics.last_message_unix_ms.store(456, Ordering::Relaxed);
+        {
+            let mut received = ReceivedMetrics::new(&metrics);
+            received.record(Utc.timestamp_millis_opt(123).single().unwrap_or_default());
+        }
+
+        assert_eq!(metrics.snapshot().last_message_unix_ms, 456);
     }
 }
