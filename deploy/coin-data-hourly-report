@@ -1,0 +1,153 @@
+#!/usr/bin/env bash
+set -uo pipefail
+
+service_name="coin-data-rs"
+api_url="${COIN_DATA_API_URL:-http://127.0.0.1:8081}"
+state_dir="${COIN_DATA_REPORT_STATE_DIR:-/var/lib/coin-data-status}"
+state_file="${state_dir}/last.env"
+
+mkdir -p "$state_dir"
+
+service_status=$(systemctl is-active "$service_name" 2>/dev/null || true)
+service_status=${service_status:-unknown}
+pid=$(systemctl show "$service_name" -p MainPID --value 2>/dev/null || true)
+restarts=$(systemctl show "$service_name" -p NRestarts --value 2>/dev/null || true)
+restarts=${restarts:-0}
+
+runtime_json=$(curl --fail --silent --show-error --max-time 5 \
+  "${api_url}/v1/runtime" 2>/dev/null || printf '{}')
+
+json_number() {
+  jq -r "$1 // 0" <<<"$runtime_json" 2>/dev/null || printf '0'
+}
+
+received=$(json_number '.runtime.received_messages')
+written=$(json_number '.runtime.written_records')
+dropped=$(json_number '.runtime.dropped_messages')
+parse_errors=$(json_number '.runtime.parse_errors')
+reconnects=$(json_number '.runtime.reconnects')
+queue_depth=$(json_number '.runtime.writer_queue_depth')
+
+previous_received=$received
+previous_written=$written
+previous_dropped=$dropped
+previous_parse_errors=$parse_errors
+previous_reconnects=$reconnects
+if [[ -r "$state_file" ]]; then
+  # The file is generated below and contains only validated integers.
+  source "$state_file"
+fi
+
+integer_or_current() {
+  local value=$1
+  local current=$2
+  if [[ $value =~ ^[0-9]+$ ]]; then
+    printf '%s' "$value"
+  else
+    printf '%s' "$current"
+  fi
+}
+
+previous_received=$(integer_or_current "$previous_received" "$received")
+previous_written=$(integer_or_current "$previous_written" "$written")
+previous_dropped=$(integer_or_current "$previous_dropped" "$dropped")
+previous_parse_errors=$(integer_or_current "$previous_parse_errors" "$parse_errors")
+previous_reconnects=$(integer_or_current "$previous_reconnects" "$reconnects")
+
+counter_delta() {
+  local current=$1
+  local previous=$2
+  if (( current >= previous )); then
+    printf '%d' "$((current - previous))"
+  else
+    printf '%d' "$current"
+  fi
+}
+
+received_delta=$(counter_delta "$received" "$previous_received")
+written_delta=$(counter_delta "$written" "$previous_written")
+dropped_delta=$(counter_delta "$dropped" "$previous_dropped")
+parse_errors_delta=$(counter_delta "$parse_errors" "$previous_parse_errors")
+reconnects_delta=$(counter_delta "$reconnects" "$previous_reconnects")
+
+printf 'previous_received=%s\nprevious_written=%s\nprevious_dropped=%s\nprevious_parse_errors=%s\nprevious_reconnects=%s\n' \
+  "$received" "$written" "$dropped" "$parse_errors" "$reconnects" >"$state_file"
+
+cpu_percent="0.0"
+rss_mib=0
+if [[ $pid =~ ^[1-9][0-9]*$ && -r /proc/$pid/stat ]]; then
+  clock_ticks=$(getconf CLK_TCK)
+  cpu_count=$(nproc)
+  before_ticks=$(awk '{print $14 + $15}' "/proc/$pid/stat")
+  before_uptime=$(awk '{print $1}' /proc/uptime)
+  sleep 1
+  if [[ -r /proc/$pid/stat ]]; then
+    after_ticks=$(awk '{print $14 + $15}' "/proc/$pid/stat")
+    after_uptime=$(awk '{print $1}' /proc/uptime)
+    cpu_percent=$(awk -v ticks="$((after_ticks - before_ticks))" \
+      -v hz="$clock_ticks" -v cores="$cpu_count" \
+      -v elapsed="$(awk -v a="$after_uptime" -v b="$before_uptime" 'BEGIN {print a-b}')" \
+      'BEGIN {if (elapsed > 0 && cores > 0) printf "%.1f", ticks / hz / elapsed * 100 / cores; else print "0.0"}')
+    rss_kib=$(awk '{print $2 * 4}' "/proc/$pid/statm")
+    rss_mib=$((rss_kib / 1024))
+  fi
+fi
+
+memory_used=$(free -m | awk '/^Mem:/ {print $3}')
+memory_total=$(free -m | awk '/^Mem:/ {print $2}')
+memory_available=$(free -m | awk '/^Mem:/ {print $7}')
+swap_used=$(free -m | awk '/^Swap:/ {print $3}')
+disk_used=$(df -P /var/lib/coin-data-rs | awk 'NR == 2 {print $5}')
+disk_available=$(df -hP /var/lib/coin-data-rs | awk 'NR == 2 {print $4}')
+data_size=$(du -sh /var/lib/coin-data-rs 2>/dev/null | awk '{print $1}')
+data_size=${data_size:-unknown}
+load_average=$(awk '{print $1, $2, $3}' /proc/loadavg)
+
+parquet_files=$(find /var/lib/coin-data-rs -type f -name '*.parquet' 2>/dev/null | wc -l)
+uploaded_files=$(find /var/lib/coin-data-rs -type f -name '*.uploaded' 2>/dev/null | wc -l)
+upload_backlog=$((parquet_files - uploaded_files))
+if (( upload_backlog < 0 )); then
+  upload_backlog=0
+fi
+
+warning_count=$(journalctl -u "$service_name" --since '-1 hour' -p warning --no-pager 2>/dev/null \
+  | grep -vc '^-- No entries --$' || true)
+host_name=$(hostname -s)
+report_time=$(date '+%Y-%m-%d %H:%M:%S %Z')
+
+read -r -d '' message <<EOF || true
+币安采集服务每小时报告
+时间：${report_time}
+服务器：${host_name}
+
+服务：${service_status}，重启 ${restarts} 次
+CPU：${cpu_percent}%（整机口径），Load ${load_average}
+内存：${memory_used}/${memory_total} MiB，可用 ${memory_available} MiB
+进程 RSS：${rss_mib} MiB，Swap：${swap_used} MiB
+磁盘：${disk_used}，剩余 ${disk_available}，数据目录 ${data_size}
+
+过去一小时：
+接收消息：+${received_delta}
+写入记录：+${written_delta}
+WS 重连：+${reconnects_delta}
+丢弃消息：+${dropped_delta}
+解析错误：+${parse_errors_delta}
+
+当前写入队列：${queue_depth}
+本地 Parquet：${parquet_files}
+上传标记：${uploaded_files}
+上传积压：${upload_backlog}
+Warning/Error：${warning_count}
+EOF
+
+if [[ -z ${TELEGRAM_BOT_TOKEN:-} || -z ${TELEGRAM_CHAT_ID:-} ]]; then
+  printf 'Telegram credentials are not configured\n' >&2
+  exit 1
+fi
+
+curl --fail --silent --show-error --max-time 15 \
+  --request POST \
+  --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+  --data-urlencode "text=${message}" \
+  "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" >/dev/null
+

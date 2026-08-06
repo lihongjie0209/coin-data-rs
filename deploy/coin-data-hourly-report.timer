@@ -1,0 +1,12 @@
+[Unit]
+Description=Send coin data status report every hour
+
+[Timer]
+OnCalendar=hourly
+Persistent=true
+RandomizedDelaySec=60
+Unit=coin-data-hourly-report.service
+
+[Install]
+WantedBy=timers.target
+
