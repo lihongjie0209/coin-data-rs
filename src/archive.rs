@@ -1,7 +1,7 @@
 use std::{
     future::Future,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
@@ -24,13 +24,13 @@ use crate::{
 
 const S3_REQUEST_TIMEOUT: Duration = Duration::from_secs(90);
 const UPLOAD_RETRY_DELAY: Duration = Duration::from_secs(30);
+const CLEANUP_INTERVAL: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone)]
 struct UploadItem {
     path: PathBuf,
 }
 
-#[derive(Clone)]
 pub struct Archiver {
     writer: Writer,
     client: Client,
@@ -41,6 +41,7 @@ pub struct Archiver {
     min_free_disk_percent: u64,
     notifier: TelegramNotifier,
     upload_lock: Arc<tokio::sync::Mutex<()>>,
+    last_cleanup: Mutex<Instant>,
 }
 
 impl Archiver {
@@ -70,6 +71,7 @@ impl Archiver {
             min_free_disk_percent: config.min_free_disk_percent,
             notifier,
             upload_lock: Arc::new(tokio::sync::Mutex::new(())),
+            last_cleanup: Mutex::new(Instant::now() - CLEANUP_INTERVAL),
         }
     }
 
@@ -177,7 +179,7 @@ impl Archiver {
         )
         .await?;
         std::fs::write(&marker, format!("{key}\n")).context("write upload marker")?;
-        self.cleanup()?;
+        self.cleanup_if_due()?;
         tracing::info!(%key, bytes = std::fs::metadata(&item.path)?.len(), "Parquet segment uploaded");
         Ok(key)
     }
@@ -218,6 +220,19 @@ impl Archiver {
                 std::fs::remove_file(marker)?;
             }
         }
+        Ok(())
+    }
+
+    fn cleanup_if_due(&self) -> Result<()> {
+        let mut last_cleanup = self
+            .last_cleanup
+            .lock()
+            .map_err(|_| anyhow::anyhow!("cleanup schedule lock poisoned"))?;
+        if last_cleanup.elapsed() < CLEANUP_INTERVAL {
+            return Ok(());
+        }
+        self.cleanup()?;
+        *last_cleanup = Instant::now();
         Ok(())
     }
 }

@@ -3,10 +3,13 @@ use chrono::{DateTime, TimeZone, Utc};
 
 use crate::{
     binance_json::{self, Event},
-    model::{Record, Value as DataValue, decimal as decimal_value, parse_decimal, text, timestamp},
+    model::{
+        Record, Value as DataValue, decimal as decimal_value, parse_decimal, static_text, text,
+        timestamp,
+    },
 };
 
-pub fn parse(payload: &[u8], received: DateTime<Utc>, source: &str) -> Result<Vec<Record>> {
+pub fn parse(payload: &[u8], received: DateTime<Utc>, source: &'static str) -> Result<Vec<Record>> {
     let (stream, events) = binance_json::decode(payload)?;
     let mut records = Vec::with_capacity(events.len());
     for data in events {
@@ -19,7 +22,7 @@ fn parse_event(
     stream: &str,
     data: &Event<'_>,
     received: DateTime<Utc>,
-    source: &str,
+    source: &'static str,
 ) -> Result<Vec<Record>> {
     match binance_json::string(data.e) {
         "depthUpdate" => Ok(vec![parse_depth(data, received, source)]),
@@ -37,7 +40,7 @@ fn parse_event(
                 millis(data.transaction_time, received),
                 boolean(data.m, false),
                 boolean(data.upper_m, true),
-                text(source),
+                static_text(source),
             ],
         )]),
         "trade" => Ok(vec![record(
@@ -52,7 +55,7 @@ fn parse_event(
                 millis(data.transaction_time, received),
                 boolean(data.m, false),
                 boolean(data.upper_m, true),
-                text(source),
+                static_text(source),
             ],
         )]),
         "kline" => Ok(vec![parse_kline(data, received, source)?]),
@@ -68,7 +71,7 @@ fn parse_event(
                 decimal(data.l),
                 decimal(data.v),
                 decimal(data.q),
-                text(source),
+                static_text(source),
             ],
         )]),
         "24hrTicker" => Ok(vec![parse_ticker(data, received, source)]),
@@ -84,7 +87,7 @@ fn parse_event(
                 text(binance_json::string(data.i)),
                 decimal(data.w),
                 millis(data.transaction_time, received),
-                text(source),
+                static_text(source),
             ],
         )]),
         "" if stream.contains("@bookTicker") => Ok(vec![record(
@@ -97,14 +100,14 @@ fn parse_event(
                 decimal(data.upper_b),
                 decimal(data.a),
                 decimal(data.upper_a),
-                text(source),
+                static_text(source),
             ],
         )]),
         _ => Ok(Vec::new()),
     }
 }
 
-fn parse_depth(data: &Event<'_>, received: DateTime<Utc>, source: &str) -> Record {
+fn parse_depth(data: &Event<'_>, received: DateTime<Utc>, source: &'static str) -> Record {
     record(
         "depth_updates",
         vec![
@@ -113,14 +116,14 @@ fn parse_depth(data: &Event<'_>, received: DateTime<Utc>, source: &str) -> Recor
             text(binance_json::string(data.s)),
             uint(data.first_update),
             uint(data.u),
-            text(source),
+            static_text(source),
             text(binance_json::json(data.b)),
             text(binance_json::json(data.a)),
         ],
     )
 }
 
-fn parse_ticker(data: &Event<'_>, received: DateTime<Utc>, source: &str) -> Record {
+fn parse_ticker(data: &Event<'_>, received: DateTime<Utc>, source: &'static str) -> Record {
     record(
         "tickers",
         vec![
@@ -147,12 +150,12 @@ fn parse_ticker(data: &Event<'_>, received: DateTime<Utc>, source: &str) -> Reco
             integer(data.upper_f),
             integer(data.upper_l),
             uint(data.n),
-            text(source),
+            static_text(source),
         ],
     )
 }
 
-fn parse_rolling_ticker(data: &Event<'_>, received: DateTime<Utc>, source: &str) -> Record {
+fn parse_rolling_ticker(data: &Event<'_>, received: DateTime<Utc>, source: &'static str) -> Record {
     let window = binance_json::string(data.e).trim_end_matches("Ticker");
     record(
         "rolling_tickers",
@@ -175,12 +178,12 @@ fn parse_rolling_ticker(data: &Event<'_>, received: DateTime<Utc>, source: &str)
             integer(data.upper_f),
             integer(data.upper_l),
             uint(data.n),
-            text(source),
+            static_text(source),
         ],
     )
 }
 
-fn parse_kline(data: &Event<'_>, received: DateTime<Utc>, source: &str) -> Result<Record> {
+fn parse_kline(data: &Event<'_>, received: DateTime<Utc>, source: &'static str) -> Result<Record> {
     let kline = binance_json::decode_nested(data.k)?;
     Ok(record(
         "klines",
@@ -205,7 +208,7 @@ fn parse_kline(data: &Event<'_>, received: DateTime<Utc>, source: &str) -> Resul
             decimal(kline.upper_v),
             decimal(kline.upper_q),
             decimal(kline.upper_b),
-            text(source),
+            static_text(source),
         ],
     ))
 }

@@ -4,11 +4,14 @@ use serde_json::{Value, value::RawValue};
 
 use crate::{
     binance_json::{self, Event},
-    model::{Record, Value as DataValue, decimal as data_decimal, parse_decimal, text, timestamp},
+    model::{
+        Record, Value as DataValue, decimal as data_decimal, parse_decimal, static_text, text,
+        timestamp,
+    },
     parser,
 };
 
-pub fn parse(payload: &[u8], received: DateTime<Utc>, source: &str) -> Result<Vec<Record>> {
+pub fn parse(payload: &[u8], received: DateTime<Utc>, source: &'static str) -> Result<Vec<Record>> {
     let (_, events) = binance_json::decode(payload)?;
     let mut records = Vec::with_capacity(events.len());
     for data in events {
@@ -20,7 +23,11 @@ pub fn parse(payload: &[u8], received: DateTime<Utc>, source: &str) -> Result<Ve
     Ok(records)
 }
 
-fn parse_event(data: &Event<'_>, received: DateTime<Utc>, source: &str) -> Result<Vec<Record>> {
+fn parse_event(
+    data: &Event<'_>,
+    received: DateTime<Utc>,
+    source: &'static str,
+) -> Result<Vec<Record>> {
     match binance_json::string(data.e) {
         "depthUpdate" => Ok(vec![parse_depth(data, received, source)]),
         "aggTrade" => Ok(vec![aggregate_trade(data, received, source)]),
@@ -38,7 +45,7 @@ pub fn parse_open_interest(
     symbol: &str,
     data: &Value,
     received: DateTime<Utc>,
-    source: &str,
+    source: &'static str,
 ) -> Record {
     Record {
         table: "futures_open_interest",
@@ -49,12 +56,12 @@ pub fn parse_open_interest(
             text(rest_string(data, "pair")),
             text(rest_string(data, "contractType")),
             decimal_value(rest_string(data, "openInterest")),
-            text(source),
+            static_text(source),
         ],
     }
 }
 
-fn parse_depth(data: &Event<'_>, received: DateTime<Utc>, source: &str) -> Record {
+fn parse_depth(data: &Event<'_>, received: DateTime<Utc>, source: &'static str) -> Record {
     Record {
         table: "futures_depth_updates",
         values: vec![
@@ -66,14 +73,14 @@ fn parse_depth(data: &Event<'_>, received: DateTime<Utc>, source: &str) -> Recor
             uint(data.first_update),
             uint(data.u),
             uint(data.pu),
-            text(source),
+            static_text(source),
             text(binance_json::json(data.b)),
             text(binance_json::json(data.a)),
         ],
     }
 }
 
-fn aggregate_trade(data: &Event<'_>, received: DateTime<Utc>, source: &str) -> Record {
+fn aggregate_trade(data: &Event<'_>, received: DateTime<Utc>, source: &'static str) -> Record {
     Record {
         table: "futures_aggregate_trades",
         values: vec![
@@ -88,12 +95,12 @@ fn aggregate_trade(data: &Event<'_>, received: DateTime<Utc>, source: &str) -> R
             uint(data.l),
             millis(data.transaction_time, received),
             boolean(data.m),
-            text(source),
+            static_text(source),
         ],
     }
 }
 
-fn book_ticker(data: &Event<'_>, received: DateTime<Utc>, source: &str) -> Record {
+fn book_ticker(data: &Event<'_>, received: DateTime<Utc>, source: &'static str) -> Record {
     Record {
         table: "futures_book_tickers",
         values: vec![
@@ -107,12 +114,12 @@ fn book_ticker(data: &Event<'_>, received: DateTime<Utc>, source: &str) -> Recor
             decimal(data.a),
             decimal(data.upper_a),
             text(binance_json::string(data.ps)),
-            text(source),
+            static_text(source),
         ],
     }
 }
 
-fn mark_price(data: &Event<'_>, received: DateTime<Utc>, source: &str) -> Record {
+fn mark_price(data: &Event<'_>, received: DateTime<Utc>, source: &'static str) -> Record {
     Record {
         table: "futures_mark_prices",
         values: vec![
@@ -125,12 +132,12 @@ fn mark_price(data: &Event<'_>, received: DateTime<Utc>, source: &str) -> Record
             decimal(data.upper_p),
             decimal(data.r),
             millis(data.transaction_time, received),
-            text(source),
+            static_text(source),
         ],
     }
 }
 
-fn liquidation(data: &Event<'_>, received: DateTime<Utc>, source: &str) -> Result<Record> {
+fn liquidation(data: &Event<'_>, received: DateTime<Utc>, source: &'static str) -> Result<Record> {
     let order = binance_json::decode_nested(data.o)?;
     Ok(Record {
         table: "futures_liquidations",
@@ -149,12 +156,12 @@ fn liquidation(data: &Event<'_>, received: DateTime<Utc>, source: &str) -> Resul
             decimal(order.z),
             millis(order.transaction_time, received),
             text(binance_json::string(order.ps)),
-            text(source),
+            static_text(source),
         ],
     })
 }
 
-fn mini_ticker(data: &Event<'_>, received: DateTime<Utc>, source: &str) -> Record {
+fn mini_ticker(data: &Event<'_>, received: DateTime<Utc>, source: &'static str) -> Record {
     Record {
         table: "futures_mini_tickers",
         values: vec![
@@ -168,12 +175,12 @@ fn mini_ticker(data: &Event<'_>, received: DateTime<Utc>, source: &str) -> Recor
             decimal(data.l),
             decimal(data.v),
             decimal(data.q),
-            text(source),
+            static_text(source),
         ],
     }
 }
 
-fn ticker(data: &Event<'_>, received: DateTime<Utc>, source: &str) -> Record {
+fn ticker(data: &Event<'_>, received: DateTime<Utc>, source: &'static str) -> Record {
     Record {
         table: "futures_tickers",
         values: vec![
@@ -196,12 +203,12 @@ fn ticker(data: &Event<'_>, received: DateTime<Utc>, source: &str) -> Record {
             integer(data.upper_f),
             integer(data.upper_l),
             uint(data.n),
-            text(source),
+            static_text(source),
         ],
     }
 }
 
-fn kline(data: &Event<'_>, received: DateTime<Utc>, source: &str) -> Result<Record> {
+fn kline(data: &Event<'_>, received: DateTime<Utc>, source: &'static str) -> Result<Record> {
     let value = binance_json::decode_nested(data.k)?;
     Ok(Record {
         table: "futures_klines",
@@ -226,7 +233,7 @@ fn kline(data: &Event<'_>, received: DateTime<Utc>, source: &str) -> Result<Reco
             decimal(value.upper_v),
             decimal(value.upper_q),
             decimal(value.upper_b),
-            text(source),
+            static_text(source),
         ],
     })
 }

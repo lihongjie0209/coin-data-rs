@@ -228,6 +228,7 @@ fn timestamp(value: &Value) -> Option<i64> {
 fn string(value: &Value) -> Option<&str> {
     match value {
         Value::Text(v) => Some(v),
+        Value::StaticText(v) => Some(v),
         Value::Null => None,
         _ => None,
     }

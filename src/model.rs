@@ -5,6 +5,7 @@ pub enum Value {
     Null,
     TimestampMicros(i64),
     Text(String),
+    StaticText(&'static str),
     U64(u64),
     I64(i64),
     Decimal(i128),
@@ -16,6 +17,7 @@ impl Value {
         std::mem::size_of::<Self>()
             + match self {
                 Self::Text(value) => value.capacity(),
+                Self::StaticText(value) => value.len(),
                 Self::Null
                 | Self::TimestampMicros(_)
                 | Self::U64(_)
@@ -38,6 +40,10 @@ pub fn timestamp(value: DateTime<Utc>) -> Value {
 
 pub fn text(value: impl Into<String>) -> Value {
     Value::Text(value.into())
+}
+
+pub const fn static_text(value: &'static str) -> Value {
+    Value::StaticText(value)
 }
 
 pub const fn decimal(value: i128) -> Value {
