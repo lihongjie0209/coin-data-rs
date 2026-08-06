@@ -1025,6 +1025,7 @@ dependencies = [
  "aws-config",
  "aws-sdk-s3",
  "axum",
+ "bytes",
  "chrono",
  "clap",
  "fs2",

@@ -43,3 +43,57 @@ pub fn text(value: impl Into<String>) -> Value {
 pub const fn decimal(value: i128) -> Value {
     Value::Decimal(value)
 }
+
+pub fn parse_decimal(raw: &str) -> Option<i128> {
+    if raw.is_empty() {
+        return None;
+    }
+    let (negative, unsigned) = raw
+        .strip_prefix('-')
+        .map_or((false, raw), |value| (true, value));
+    let (whole, fraction) = unsigned.split_once('.').unwrap_or((unsigned, ""));
+    if whole.is_empty() && fraction.is_empty() {
+        return None;
+    }
+
+    let mut scaled = 0i128;
+    for digit in whole.bytes() {
+        if !digit.is_ascii_digit() {
+            return None;
+        }
+        scaled = scaled
+            .checked_mul(10)?
+            .checked_add(i128::from(digit - b'0'))?;
+    }
+    for digit in fraction.bytes().take(18) {
+        if !digit.is_ascii_digit() {
+            return None;
+        }
+        scaled = scaled
+            .checked_mul(10)?
+            .checked_add(i128::from(digit - b'0'))?;
+    }
+    for _ in fraction.len().min(18)..18 {
+        scaled = scaled.checked_mul(10)?;
+    }
+    if negative {
+        scaled.checked_neg()
+    } else {
+        Some(scaled)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_decimal;
+
+    #[test]
+    fn parse_decimal_should_scale_without_rounding() {
+        assert_eq!(parse_decimal("-12.34"), Some(-12_340_000_000_000_000_000));
+    }
+
+    #[test]
+    fn parse_decimal_should_reject_invalid_input() {
+        assert_eq!(parse_decimal("12x"), None);
+    }
+}

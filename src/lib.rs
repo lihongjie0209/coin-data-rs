@@ -1,5 +1,6 @@
 pub mod api;
 pub mod archive;
+mod binance_json;
 pub mod collector;
 pub mod compactor;
 pub mod config;

@@ -1,80 +1,76 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
 use chrono::{DateTime, TimeZone, Utc};
-use serde_json::Value;
 
-use crate::model::{Record, Value as DataValue, decimal as decimal_value, text, timestamp};
+use crate::{
+    binance_json::{self, Event},
+    model::{Record, Value as DataValue, decimal as decimal_value, parse_decimal, text, timestamp},
+};
 
 pub fn parse(payload: &[u8], received: DateTime<Utc>, source: &str) -> Result<Vec<Record>> {
-    let envelope: Value = serde_json::from_slice(payload).context("decode websocket event")?;
-    let stream = envelope
-        .get("stream")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    let data = envelope.get("data").unwrap_or(&envelope);
-    let event = string(data, "e");
-    match event {
-        "depthUpdate" => parse_depth(data, received, source),
+    let (stream, data) = binance_json::decode(payload)?;
+    match binance_json::string(data.e) {
+        "depthUpdate" => Ok(vec![parse_depth(&data, received, source)]),
         "aggTrade" => Ok(vec![record(
             "aggregate_trades",
             vec![
-                event_time(data, received),
+                event_time(&data, received),
                 timestamp(received),
-                text(string(data, "s")),
-                uint(data, "a"),
-                decimal(data, "p"),
-                decimal(data, "q"),
-                uint(data, "f"),
-                uint(data, "l"),
-                millis(data, "T", received),
-                boolean(data, "m"),
-                optional_boolean(data, "M", true),
+                text(binance_json::string(data.s)),
+                uint(data.a),
+                decimal(data.p),
+                decimal(data.q),
+                uint(data.f),
+                uint(data.l),
+                millis(data.transaction_time, received),
+                boolean(data.m, false),
+                boolean(data.upper_m, true),
                 text(source),
             ],
         )]),
         "trade" => Ok(vec![record(
             "trades",
             vec![
-                event_time(data, received),
+                event_time(&data, received),
                 timestamp(received),
-                text(string(data, "s")),
-                uint(data, "t"),
-                decimal(data, "p"),
-                decimal(data, "q"),
-                millis(data, "T", received),
-                boolean(data, "m"),
-                optional_boolean(data, "M", true),
+                text(binance_json::string(data.s)),
+                uint(data.t),
+                decimal(data.p),
+                decimal(data.q),
+                millis(data.transaction_time, received),
+                boolean(data.m, false),
+                boolean(data.upper_m, true),
                 text(source),
             ],
         )]),
-        "kline" => Ok(vec![parse_kline(data, received, source)]),
+        "kline" => Ok(vec![parse_kline(&data, received, source)?]),
         "24hrMiniTicker" => Ok(vec![record(
             "mini_tickers",
             vec![
-                event_time(data, received),
+                event_time(&data, received),
                 timestamp(received),
-                text(string(data, "s")),
-                decimal(data, "c"),
-                decimal(data, "o"),
-                decimal(data, "h"),
-                decimal(data, "l"),
-                decimal(data, "v"),
-                decimal(data, "q"),
+                text(binance_json::string(data.s)),
+                decimal(data.c),
+                decimal(data.o),
+                decimal(data.h),
+                decimal(data.l),
+                decimal(data.v),
+                decimal(data.q),
                 text(source),
             ],
         )]),
-        "24hrTicker" => Ok(vec![parse_ticker(data, received, source)]),
+        "24hrTicker" => Ok(vec![parse_ticker(&data, received, source)]),
         "1hTicker" | "4hTicker" | "1dTicker" => {
-            Ok(vec![parse_rolling_ticker(data, received, source)])
+            Ok(vec![parse_rolling_ticker(&data, received, source)])
         }
         "avgPrice" => Ok(vec![record(
             "average_prices",
             vec![
-                event_time(data, received),
+                event_time(&data, received),
                 timestamp(received),
-                text(string(data, "s")),
-                text(string(data, "i")),
-                decimal(data, "w"),
-                millis(data, "T", received),
+                text(binance_json::string(data.s)),
+                text(binance_json::string(data.i)),
+                decimal(data.w),
+                millis(data.transaction_time, received),
                 text(source),
             ],
         )]),
@@ -82,12 +78,12 @@ pub fn parse(payload: &[u8], received: DateTime<Utc>, source: &str) -> Result<Ve
             "book_tickers",
             vec![
                 timestamp(received),
-                text(string(data, "s")),
-                uint(data, "u"),
-                decimal(data, "b"),
-                decimal(data, "B"),
-                decimal(data, "a"),
-                decimal(data, "A"),
+                text(binance_json::string(data.s)),
+                uint(data.u),
+                decimal(data.b),
+                decimal(data.upper_b),
+                decimal(data.a),
+                decimal(data.upper_a),
                 text(source),
             ],
         )]),
@@ -95,167 +91,139 @@ pub fn parse(payload: &[u8], received: DateTime<Utc>, source: &str) -> Result<Ve
     }
 }
 
-fn parse_depth(data: &Value, received: DateTime<Utc>, source: &str) -> Result<Vec<Record>> {
-    let event_at = event_time(data, received);
-    let symbol = string(data, "s");
-    let first = uint(data, "U");
-    let final_id = uint(data, "u");
-    Ok(vec![record(
+fn parse_depth(data: &Event<'_>, received: DateTime<Utc>, source: &str) -> Record {
+    record(
         "depth_updates",
         vec![
-            event_at,
+            event_time(data, received),
             timestamp(received),
-            text(symbol),
-            first,
-            final_id,
+            text(binance_json::string(data.s)),
+            uint(data.first_update),
+            uint(data.u),
             text(source),
-            json_array(data, "b")?,
-            json_array(data, "a")?,
+            text(binance_json::json(data.b)),
+            text(binance_json::json(data.a)),
         ],
-    )])
+    )
 }
 
-fn json_array(value: &Value, key: &str) -> Result<DataValue> {
-    let array = value
-        .get(key)
-        .and_then(Value::as_array)
-        .map_or(&[][..], Vec::as_slice);
-    Ok(text(serde_json::to_string(array)?))
-}
-
-fn parse_ticker(data: &Value, received: DateTime<Utc>, source: &str) -> Record {
+fn parse_ticker(data: &Event<'_>, received: DateTime<Utc>, source: &str) -> Record {
     record(
         "tickers",
         vec![
             event_time(data, received),
             timestamp(received),
-            text(string(data, "s")),
-            decimal(data, "p"),
-            decimal(data, "P"),
-            decimal(data, "w"),
-            decimal(data, "x"),
-            decimal(data, "c"),
-            decimal(data, "Q"),
-            decimal(data, "b"),
-            decimal(data, "B"),
-            decimal(data, "a"),
-            decimal(data, "A"),
-            decimal(data, "o"),
-            decimal(data, "h"),
-            decimal(data, "l"),
-            decimal(data, "v"),
-            decimal(data, "q"),
-            millis(data, "O", received),
-            millis(data, "C", received),
-            integer(data, "F"),
-            integer(data, "L"),
-            uint(data, "n"),
+            text(binance_json::string(data.s)),
+            decimal(data.p),
+            decimal(data.upper_p),
+            decimal(data.w),
+            decimal(data.x),
+            decimal(data.c),
+            decimal(data.upper_q),
+            decimal(data.b),
+            decimal(data.upper_b),
+            decimal(data.a),
+            decimal(data.upper_a),
+            decimal(data.o),
+            decimal(data.h),
+            decimal(data.l),
+            decimal(data.v),
+            decimal(data.q),
+            millis(data.open_time, received),
+            millis(data.close_time, received),
+            integer(data.upper_f),
+            integer(data.upper_l),
+            uint(data.n),
             text(source),
         ],
     )
 }
 
-fn parse_rolling_ticker(data: &Value, received: DateTime<Utc>, source: &str) -> Record {
-    let window = string(data, "e").trim_end_matches("Ticker");
+fn parse_rolling_ticker(data: &Event<'_>, received: DateTime<Utc>, source: &str) -> Record {
+    let window = binance_json::string(data.e).trim_end_matches("Ticker");
     record(
         "rolling_tickers",
         vec![
             event_time(data, received),
             timestamp(received),
-            text(string(data, "s")),
+            text(binance_json::string(data.s)),
             text(window),
-            decimal(data, "p"),
-            decimal(data, "P"),
-            decimal(data, "o"),
-            decimal(data, "h"),
-            decimal(data, "l"),
-            decimal(data, "c"),
-            decimal(data, "w"),
-            decimal(data, "v"),
-            decimal(data, "q"),
-            millis(data, "O", received),
-            millis(data, "C", received),
-            integer(data, "F"),
-            integer(data, "L"),
-            uint(data, "n"),
+            decimal(data.p),
+            decimal(data.upper_p),
+            decimal(data.o),
+            decimal(data.h),
+            decimal(data.l),
+            decimal(data.c),
+            decimal(data.w),
+            decimal(data.v),
+            decimal(data.q),
+            millis(data.open_time, received),
+            millis(data.close_time, received),
+            integer(data.upper_f),
+            integer(data.upper_l),
+            uint(data.n),
             text(source),
         ],
     )
 }
 
-fn parse_kline(data: &Value, received: DateTime<Utc>, source: &str) -> Record {
-    let kline = data.get("k").unwrap_or(&Value::Null);
-    record(
+fn parse_kline(data: &Event<'_>, received: DateTime<Utc>, source: &str) -> Result<Record> {
+    let kline = binance_json::decode_nested(data.k)?;
+    Ok(record(
         "klines",
         vec![
             event_time(data, received),
             timestamp(received),
-            text(string(data, "s")),
-            millis(kline, "t", received),
-            millis(kline, "T", received),
-            text(string(kline, "s")),
-            text(string(kline, "i")),
-            integer(kline, "f"),
-            integer(kline, "L"),
-            decimal(kline, "o"),
-            decimal(kline, "c"),
-            decimal(kline, "h"),
-            decimal(kline, "l"),
-            decimal(kline, "v"),
-            uint(kline, "n"),
-            boolean(kline, "x"),
-            decimal(kline, "q"),
-            decimal(kline, "V"),
-            decimal(kline, "Q"),
-            decimal(kline, "B"),
+            text(binance_json::string(data.s)),
+            millis(kline.t, received),
+            millis(kline.transaction_time, received),
+            text(binance_json::string(kline.s)),
+            text(binance_json::string(kline.i)),
+            integer(kline.f),
+            integer(kline.upper_l),
+            decimal(kline.o),
+            decimal(kline.c),
+            decimal(kline.h),
+            decimal(kline.l),
+            decimal(kline.v),
+            uint(kline.n),
+            boolean(kline.x, false),
+            decimal(kline.q),
+            decimal(kline.upper_v),
+            decimal(kline.upper_q),
+            decimal(kline.upper_b),
             text(source),
         ],
-    )
+    ))
 }
 
 fn record(table: &'static str, values: Vec<DataValue>) -> Record {
     Record { table, values }
 }
-fn string<'a>(value: &'a Value, key: &str) -> &'a str {
-    value.get(key).and_then(Value::as_str).unwrap_or_default()
+
+fn decimal(raw: Option<&serde_json::value::RawValue>) -> DataValue {
+    let raw = binance_json::string(raw);
+    decimal_value(parse_decimal(raw).unwrap_or_default())
 }
-fn decimal(value: &Value, key: &str) -> DataValue {
-    let raw = string(value, key);
-    let (negative, unsigned) = raw
-        .strip_prefix('-')
-        .map_or((false, raw), |value| (true, value));
-    let (whole, fraction) = unsigned.split_once('.').unwrap_or((unsigned, ""));
-    let mut digits = String::with_capacity(whole.len() + 18);
-    digits.push_str(if whole.is_empty() { "0" } else { whole });
-    digits.extend(fraction.chars().take(18));
-    digits.extend(std::iter::repeat_n(
-        '0',
-        18usize.saturating_sub(fraction.len()),
-    ));
-    let scaled = digits
-        .parse::<i128>()
-        .ok()
-        .map(|value| if negative { -value } else { value })
-        .unwrap_or_default();
-    decimal_value(scaled)
+
+fn uint(raw: Option<&serde_json::value::RawValue>) -> DataValue {
+    DataValue::U64(binance_json::u64(raw))
 }
-fn uint(value: &Value, key: &str) -> DataValue {
-    DataValue::U64(value.get(key).and_then(Value::as_u64).unwrap_or_default())
+
+fn integer(raw: Option<&serde_json::value::RawValue>) -> DataValue {
+    DataValue::I64(binance_json::i64(raw))
 }
-fn integer(value: &Value, key: &str) -> DataValue {
-    DataValue::I64(value.get(key).and_then(Value::as_i64).unwrap_or_default())
+
+fn boolean(raw: Option<&serde_json::value::RawValue>, default: bool) -> DataValue {
+    DataValue::Boolean(binance_json::boolean(raw, default))
 }
-fn boolean(value: &Value, key: &str) -> DataValue {
-    DataValue::Boolean(value.get(key).and_then(Value::as_bool).unwrap_or_default())
+
+fn event_time(value: &Event<'_>, fallback: DateTime<Utc>) -> DataValue {
+    millis(value.event_time, fallback)
 }
-fn optional_boolean(value: &Value, key: &str, default: bool) -> DataValue {
-    DataValue::Boolean(value.get(key).and_then(Value::as_bool).unwrap_or(default))
-}
-fn event_time(value: &Value, fallback: DateTime<Utc>) -> DataValue {
-    millis(value, "E", fallback)
-}
-fn millis(value: &Value, key: &str, fallback: DateTime<Utc>) -> DataValue {
-    let milliseconds = value.get(key).and_then(Value::as_i64).unwrap_or_default();
+
+fn millis(raw: Option<&serde_json::value::RawValue>, fallback: DateTime<Utc>) -> DataValue {
+    let milliseconds = binance_json::i64(raw);
     let value = if milliseconds == 0 {
         fallback
     } else {

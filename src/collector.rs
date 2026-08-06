@@ -1,6 +1,7 @@
 use std::{sync::Arc, time::Duration};
 
 use anyhow::{Context, Result, bail};
+use bytes::Bytes;
 use chrono::Utc;
 use futures_util::{SinkExt, StreamExt};
 use tokio::sync::mpsc;
@@ -79,8 +80,8 @@ async fn collect(
             message = incoming.next() => message.context("websocket stream ended")??,
         };
         let payload = match message {
-            Message::Text(text) => text.as_bytes().to_vec(),
-            Message::Binary(bytes) => bytes.to_vec(),
+            Message::Text(text) => <_ as AsRef<Bytes>>::as_ref(&text).clone(),
+            Message::Binary(bytes) => bytes,
             Message::Ping(payload) => {
                 outgoing
                     .send(Message::Pong(payload))
@@ -107,47 +108,59 @@ async fn collect(
 }
 
 async fn process_payloads(
-    mut receiver: mpsc::Receiver<(Vec<u8>, chrono::DateTime<Utc>)>,
+    mut receiver: mpsc::Receiver<(Bytes, chrono::DateTime<Utc>)>,
     writer: Writer,
     metrics: Arc<Metrics>,
     market: Market,
     shard_id: usize,
 ) -> Result<()> {
-    while let Some((payload, received)) = receiver.recv().await {
-        let parsed = if market == Market::Spot {
-            parser::parse(&payload, received, "binance_spot_websocket")
-        } else {
-            futures_parser::parse(
-                &payload,
-                received,
-                if market == Market::Usdm {
-                    "binance_usdm_websocket"
-                } else {
-                    "binance_coinm_websocket"
-                },
-            )
-        };
-        match parsed {
-            Ok(records) if !records.is_empty() => {
-                metrics
-                    .parsed_records
-                    .fetch_add(records.len() as u64, std::sync::atomic::Ordering::Relaxed);
-                writer.records(market, records).await?;
-            }
-            Ok(_) => {
-                if let Ok(control) = serde_json::from_slice::<serde_json::Value>(&payload)
-                    && (control.get("result").is_some() || control.get("code").is_some())
-                {
-                    tracing::info!(shard = shard_id, response = %control, "websocket control response");
+    const PAYLOAD_BATCH_SIZE: usize = 64;
+
+    let mut payloads = Vec::with_capacity(PAYLOAD_BATCH_SIZE);
+    loop {
+        let received_count = receiver.recv_many(&mut payloads, PAYLOAD_BATCH_SIZE).await;
+        if received_count == 0 {
+            return Ok(());
+        }
+        let mut record_batch = Vec::with_capacity(received_count);
+        for (payload, received) in payloads.drain(..) {
+            let parsed = if market == Market::Spot {
+                parser::parse(&payload, received, "binance_spot_websocket")
+            } else {
+                futures_parser::parse(
+                    &payload,
+                    received,
+                    if market == Market::Usdm {
+                        "binance_usdm_websocket"
+                    } else {
+                        "binance_coinm_websocket"
+                    },
+                )
+            };
+            match parsed {
+                Ok(records) if !records.is_empty() => {
+                    metrics
+                        .parsed_records
+                        .fetch_add(records.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                    record_batch.extend(records);
+                }
+                Ok(_) => {
+                    if let Ok(control) = serde_json::from_slice::<serde_json::Value>(&payload)
+                        && (control.get("result").is_some() || control.get("code").is_some())
+                    {
+                        tracing::info!(shard = shard_id, response = %control, "websocket control response");
+                    }
+                }
+                Err(error) => {
+                    metrics
+                        .parse_errors
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    tracing::warn!(shard = shard_id, %error, "invalid websocket event");
                 }
             }
-            Err(error) => {
-                metrics
-                    .parse_errors
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                tracing::warn!(shard = shard_id, %error, "invalid websocket event");
-            }
+        }
+        if !record_batch.is_empty() {
+            writer.records(market, record_batch).await?;
         }
     }
-    Ok(())
 }
