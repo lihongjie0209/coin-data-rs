@@ -1,0 +1,20 @@
+[Unit]
+Description=Notify Telegram when the coin data collector starts or restarts
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/coin-data-rs.env
+ExecStart=/usr/local/sbin/coin-data-restart-notify
+Nice=10
+CPUWeight=10
+CPUQuota=5%
+IOWeight=10
+MemoryMax=32M
+TimeoutStartSec=30
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+

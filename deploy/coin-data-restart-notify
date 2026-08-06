@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+set -uo pipefail
+
+service_name="coin-data-rs"
+status=$(systemctl is-active "$service_name" 2>/dev/null || true)
+status=${status:-unknown}
+pid=$(systemctl show "$service_name" -p MainPID --value 2>/dev/null || true)
+pid=${pid:-unknown}
+restarts=$(systemctl show "$service_name" -p NRestarts --value 2>/dev/null || true)
+restarts=${restarts:-0}
+started_at=$(systemctl show "$service_name" -p ActiveEnterTimestamp --value 2>/dev/null || true)
+started_at=${started_at:-unknown}
+host_name=$(hostname -s)
+report_time=$(date '+%Y-%m-%d %H:%M:%S %Z')
+
+read -r -d '' message <<EOF || true
+⚠️ 币安采集器启动/重启通知
+时间：${report_time}
+服务器：${host_name}
+状态：${status}
+PID：${pid}
+systemd 自动重启累计：${restarts}
+本次启动时间：${started_at}
+EOF
+
+if [[ ${COIN_DATA_NOTIFY_DRY_RUN:-0} == 1 ]]; then
+  printf '%s\n' "$message"
+  exit 0
+fi
+
+if [[ -z ${TELEGRAM_BOT_TOKEN:-} || -z ${TELEGRAM_CHAT_ID:-} ]]; then
+  printf 'Telegram credentials are not configured\n' >&2
+  exit 1
+fi
+
+curl --fail --silent --show-error --max-time 15 \
+  --request POST \
+  --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+  --data-urlencode "text=${message}" \
+  "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" >/dev/null
+

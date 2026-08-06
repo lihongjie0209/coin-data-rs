@@ -69,7 +69,6 @@ written_delta=$(counter_delta "$written" "$previous_written")
 dropped_delta=$(counter_delta "$dropped" "$previous_dropped")
 parse_errors_delta=$(counter_delta "$parse_errors" "$previous_parse_errors")
 reconnects_delta=$(counter_delta "$reconnects" "$previous_reconnects")
-
 printf 'previous_received=%s\nprevious_written=%s\nprevious_dropped=%s\nprevious_parse_errors=%s\nprevious_reconnects=%s\n' \
   "$received" "$written" "$dropped" "$parse_errors" "$reconnects" >"$state_file"
 
@@ -140,6 +139,11 @@ WS 重连：+${reconnects_delta}
 Warning/Error：${warning_count}
 EOF
 
+if [[ ${COIN_DATA_REPORT_DRY_RUN:-0} == 1 ]]; then
+  printf '%s\n' "$message"
+  exit 0
+fi
+
 if [[ -z ${TELEGRAM_BOT_TOKEN:-} || -z ${TELEGRAM_CHAT_ID:-} ]]; then
   printf 'Telegram credentials are not configured\n' >&2
   exit 1
@@ -150,4 +154,3 @@ curl --fail --silent --show-error --max-time 15 \
   --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
   --data-urlencode "text=${message}" \
   "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" >/dev/null
-
