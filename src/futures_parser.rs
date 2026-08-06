@@ -9,17 +9,28 @@ use crate::{
 };
 
 pub fn parse(payload: &[u8], received: DateTime<Utc>, source: &str) -> Result<Vec<Record>> {
-    let (_, data) = binance_json::decode(payload)?;
+    let (_, events) = binance_json::decode(payload)?;
+    let mut records = Vec::with_capacity(events.len());
+    for data in events {
+        records.extend(parse_event(&data, received, source)?);
+    }
+    if records.is_empty() {
+        return parser::parse(payload, received, source);
+    }
+    Ok(records)
+}
+
+fn parse_event(data: &Event<'_>, received: DateTime<Utc>, source: &str) -> Result<Vec<Record>> {
     match binance_json::string(data.e) {
-        "depthUpdate" => Ok(vec![parse_depth(&data, received, source)]),
-        "aggTrade" => Ok(vec![aggregate_trade(&data, received, source)]),
-        "bookTicker" => Ok(vec![book_ticker(&data, received, source)]),
-        "markPriceUpdate" => Ok(vec![mark_price(&data, received, source)]),
-        "forceOrder" => Ok(vec![liquidation(&data, received, source)?]),
-        "24hrMiniTicker" => Ok(vec![mini_ticker(&data, received, source)]),
-        "24hrTicker" => Ok(vec![ticker(&data, received, source)]),
-        "kline" => Ok(vec![kline(&data, received, source)?]),
-        _ => parser::parse(payload, received, source),
+        "depthUpdate" => Ok(vec![parse_depth(data, received, source)]),
+        "aggTrade" => Ok(vec![aggregate_trade(data, received, source)]),
+        "bookTicker" => Ok(vec![book_ticker(data, received, source)]),
+        "markPriceUpdate" => Ok(vec![mark_price(data, received, source)]),
+        "forceOrder" => Ok(vec![liquidation(data, received, source)?]),
+        "24hrMiniTicker" => Ok(vec![mini_ticker(data, received, source)]),
+        "24hrTicker" => Ok(vec![ticker(data, received, source)]),
+        "kline" => Ok(vec![kline(data, received, source)?]),
+        _ => Ok(Vec::new()),
     }
 }
 

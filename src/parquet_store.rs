@@ -2,7 +2,7 @@ use std::{
     collections::HashMap,
     fs::File,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, OnceLock},
 };
 
 use anyhow::{Context, Result, bail};
@@ -80,11 +80,17 @@ pub fn write_segment(
 }
 
 fn schema_for(table: &str) -> Result<Arc<Schema>> {
+    static SCHEMAS: OnceLock<HashMap<String, Arc<Schema>>> = OnceLock::new();
+    if let Some(schema) = SCHEMAS.get().and_then(|schemas| schemas.get(table)) {
+        return Ok(Arc::clone(schema));
+    }
     let schemas = parse_schemas()?;
-    schemas
+    let schema = schemas
         .get(table)
         .cloned()
-        .with_context(|| format!("unknown table schema {table}"))
+        .with_context(|| format!("unknown table schema {table}"));
+    let _ = SCHEMAS.set(schemas);
+    schema
 }
 
 fn parse_schemas() -> Result<HashMap<String, Arc<Schema>>> {

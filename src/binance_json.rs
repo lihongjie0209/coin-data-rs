@@ -94,12 +94,16 @@ pub(crate) struct Event<'a> {
     pub k: Option<&'a RawValue>,
 }
 
-pub(crate) fn decode(payload: &[u8]) -> Result<(&str, Event<'_>)> {
+pub(crate) fn decode(payload: &[u8]) -> Result<(&str, Vec<Event<'_>>)> {
     let envelope: Envelope<'_> =
         serde_json::from_slice(payload).context("decode websocket envelope")?;
     let event_payload = envelope.data.map_or(payload, |data| data.get().as_bytes());
-    let event = serde_json::from_slice(event_payload).context("decode websocket event")?;
-    Ok((envelope.stream, event))
+    let events = if event_payload.first() == Some(&b'[') {
+        serde_json::from_slice(event_payload).context("decode websocket event array")?
+    } else {
+        vec![serde_json::from_slice(event_payload).context("decode websocket event")?]
+    };
+    Ok((envelope.stream, events))
 }
 
 pub(crate) fn decode_nested(raw: Option<&RawValue>) -> Result<Event<'_>> {
@@ -148,12 +152,12 @@ mod tests {
 
     #[test]
     fn decode_should_borrow_combined_stream_fields() -> Result<()> {
-        let (stream, event) = decode(
+        let (stream, events) = decode(
             br#"{"stream":"btcusdt@trade","data":{"e":"trade","E":12,"s":"BTCUSDT","p":"1.25"}}"#,
         )?;
 
         assert_eq!(
-            (stream, string(event.e), string(event.s)),
+            (stream, string(events[0].e), string(events[0].s)),
             ("btcusdt@trade", "trade", "BTCUSDT")
         );
         Ok(())
@@ -161,9 +165,19 @@ mod tests {
 
     #[test]
     fn decode_should_support_raw_events() -> Result<()> {
-        let (stream, event) = decode(br#"{"e":"bookTicker","u":7,"s":"BTCUSDT"}"#)?;
+        let (stream, events) = decode(br#"{"e":"bookTicker","u":7,"s":"BTCUSDT"}"#)?;
 
-        assert_eq!((stream, u64(event.u)), ("", 7));
+        assert_eq!((stream, u64(events[0].u)), ("", 7));
+        Ok(())
+    }
+
+    #[test]
+    fn decode_should_support_all_market_arrays() -> Result<()> {
+        let (_, events) = decode(
+            br#"{"stream":"!miniTicker@arr","data":[{"e":"24hrMiniTicker","s":"BTCUSDT"},{"e":"24hrMiniTicker","s":"ETHUSDT"}]}"#,
+        )?;
+
+        assert_eq!(events.len(), 2);
         Ok(())
     }
 }

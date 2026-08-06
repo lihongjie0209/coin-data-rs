@@ -92,6 +92,7 @@ async fn start_dataset(config: Config, writer: Writer, metrics: Arc<Metrics>) ->
         .spawn();
     }
     let mut shard_id = 0;
+    let payload_sender = collector::start_processor(writer, Arc::clone(&metrics), config.market);
     let groups = config.stream_groups();
     let connection_counts = config.connection_counts(symbols.len());
     for (group, connection_count) in groups.into_iter().zip(connection_counts) {
@@ -101,9 +102,8 @@ async fn start_dataset(config: Config, writer: Writer, metrics: Arc<Metrics>) ->
                 group.name,
                 group.url.clone(),
                 streams,
-                writer.clone(),
+                payload_sender.clone(),
                 Arc::clone(&metrics),
-                config.market,
             ));
             shard_id += 1;
         }

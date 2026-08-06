@@ -4,9 +4,9 @@ use anyhow::{Result, bail};
 use clap::{Parser, ValueEnum};
 
 pub const DEFAULT_SYMBOLS: &str = "ALL";
-pub const DEFAULT_STREAMS: &str = "depth@100ms,aggTrade,trade,kline_1s,miniTicker,ticker,ticker_1h,ticker_4h,ticker_1d,bookTicker,avgPrice";
+pub const DEFAULT_STREAMS: &str = "depth@100ms,aggTrade,trade,kline_1s,!miniTicker@arr,ticker,!ticker_1h@arr,!ticker_4h@arr,!ticker_1d@arr,bookTicker,avgPrice";
 pub const DEFAULT_FUTURES_STREAMS: &str =
-    "depth@100ms,aggTrade,kline_1m,miniTicker,ticker,bookTicker,markPrice@1s,forceOrder";
+    "depth@100ms,aggTrade,kline_1m,miniTicker,ticker,!bookTicker,!markPrice@arr@1s,!forceOrder@arr";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StreamGroup {
@@ -288,14 +288,15 @@ impl Config {
         }
     }
 
-    fn required_connection_count(
-        &self,
-        symbol_count: usize,
-        stream_count: usize,
-        stream_limit: usize,
-    ) -> usize {
+    fn required_connection_count(&self, symbol_count: usize, group: &StreamGroup) -> usize {
         let required = match self.exchange {
-            Exchange::Binance => (symbol_count * stream_count).div_ceil(stream_limit),
+            Exchange::Binance => {
+                let (global, per_symbol) = group
+                    .streams
+                    .iter()
+                    .partition::<Vec<_>, _>(|stream| stream.starts_with('!'));
+                (symbol_count * per_symbol.len() + global.len()).div_ceil(self.stream_limit(group))
+            }
             Exchange::Okx | Exchange::Bybit => symbol_count.div_ceil(100),
         };
         required.max(1).min(symbol_count)
@@ -309,13 +310,7 @@ impl Config {
         let groups = self.stream_groups();
         let mut counts = groups
             .iter()
-            .map(|group| {
-                self.required_connection_count(
-                    symbol_count,
-                    group.streams.len(),
-                    self.stream_limit(group),
-                )
-            })
+            .map(|group| self.required_connection_count(symbol_count, group))
             .collect::<Vec<_>>();
         let target = self.ws_connections.max(counts.iter().sum());
         while counts.iter().sum::<usize>() < target {
@@ -359,7 +354,7 @@ impl Config {
         if (self.exchange, self.market) == (Exchange::Binance, Market::Usdm) {
             let (public, market): (Vec<_>, Vec<_>) = streams
                 .into_iter()
-                .partition(|stream| stream.starts_with("depth") || stream.as_str() == "bookTicker");
+                .partition(|stream| stream.starts_with("depth") || stream.ends_with("bookTicker"));
             return [
                 ("public", "wss://fstream.binance.com/public/stream", public),
                 ("market", "wss://fstream.binance.com/market/stream", market),
@@ -413,8 +408,15 @@ impl Config {
 
     pub fn shards(&self, symbols: &[String], streams: &[String], count: usize) -> Vec<Vec<String>> {
         let mut shards = vec![Vec::new(); count];
+        for (global_count, stream) in streams
+            .iter()
+            .filter(|stream| stream.starts_with('!'))
+            .enumerate()
+        {
+            shards[global_count % count].push(stream.clone());
+        }
         for (index, symbol) in symbols.iter().enumerate() {
-            for stream in streams {
+            for stream in streams.iter().filter(|stream| !stream.starts_with('!')) {
                 shards[index % count].push(format!("{}@{stream}", symbol.to_lowercase()));
             }
         }
@@ -476,7 +478,26 @@ mod tests {
             .iter()
             .position(|group| group.name == "public")
             .unwrap_or_default();
-        assert_eq!(counts[public], 12);
-        assert!(728 * groups[public].streams.len() / counts[public] <= 128);
+        assert_eq!(counts[public], 6);
+        assert!((728 + 1) / counts[public] <= 128);
+    }
+
+    #[test]
+    fn global_stream_should_only_be_subscribed_once() {
+        let config = Config::parse_from(["coin-data-rs"]);
+        let shards = config.shards(
+            &["BTCUSDT".to_owned(), "ETHUSDT".to_owned()],
+            &["depth@100ms".to_owned(), "!miniTicker@arr".to_owned()],
+            2,
+        );
+
+        assert_eq!(
+            shards
+                .iter()
+                .flatten()
+                .filter(|stream| *stream == "!miniTicker@arr")
+                .count(),
+            1
+        );
     }
 }

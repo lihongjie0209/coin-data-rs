@@ -7,13 +7,26 @@ use crate::{
 };
 
 pub fn parse(payload: &[u8], received: DateTime<Utc>, source: &str) -> Result<Vec<Record>> {
-    let (stream, data) = binance_json::decode(payload)?;
+    let (stream, events) = binance_json::decode(payload)?;
+    let mut records = Vec::with_capacity(events.len());
+    for data in events {
+        records.extend(parse_event(stream, &data, received, source)?);
+    }
+    Ok(records)
+}
+
+fn parse_event(
+    stream: &str,
+    data: &Event<'_>,
+    received: DateTime<Utc>,
+    source: &str,
+) -> Result<Vec<Record>> {
     match binance_json::string(data.e) {
-        "depthUpdate" => Ok(vec![parse_depth(&data, received, source)]),
+        "depthUpdate" => Ok(vec![parse_depth(data, received, source)]),
         "aggTrade" => Ok(vec![record(
             "aggregate_trades",
             vec![
-                event_time(&data, received),
+                event_time(data, received),
                 timestamp(received),
                 text(binance_json::string(data.s)),
                 uint(data.a),
@@ -30,7 +43,7 @@ pub fn parse(payload: &[u8], received: DateTime<Utc>, source: &str) -> Result<Ve
         "trade" => Ok(vec![record(
             "trades",
             vec![
-                event_time(&data, received),
+                event_time(data, received),
                 timestamp(received),
                 text(binance_json::string(data.s)),
                 uint(data.t),
@@ -42,11 +55,11 @@ pub fn parse(payload: &[u8], received: DateTime<Utc>, source: &str) -> Result<Ve
                 text(source),
             ],
         )]),
-        "kline" => Ok(vec![parse_kline(&data, received, source)?]),
+        "kline" => Ok(vec![parse_kline(data, received, source)?]),
         "24hrMiniTicker" => Ok(vec![record(
             "mini_tickers",
             vec![
-                event_time(&data, received),
+                event_time(data, received),
                 timestamp(received),
                 text(binance_json::string(data.s)),
                 decimal(data.c),
@@ -58,14 +71,14 @@ pub fn parse(payload: &[u8], received: DateTime<Utc>, source: &str) -> Result<Ve
                 text(source),
             ],
         )]),
-        "24hrTicker" => Ok(vec![parse_ticker(&data, received, source)]),
+        "24hrTicker" => Ok(vec![parse_ticker(data, received, source)]),
         "1hTicker" | "4hTicker" | "1dTicker" => {
-            Ok(vec![parse_rolling_ticker(&data, received, source)])
+            Ok(vec![parse_rolling_ticker(data, received, source)])
         }
         "avgPrice" => Ok(vec![record(
             "average_prices",
             vec![
-                event_time(&data, received),
+                event_time(data, received),
                 timestamp(received),
                 text(binance_json::string(data.s)),
                 text(binance_json::string(data.i)),
