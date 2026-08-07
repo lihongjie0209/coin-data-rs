@@ -9,7 +9,7 @@ User=coin-data
 Group=coin-data
 EnvironmentFile=-/etc/coin-data-rs.env
 Environment=RUST_LOG=coin_data=info
-ExecStart=/usr/local/bin/coin-data-rs --exchange binance --database /var/lib/coin-data-rs/market.duckdb --api-address 127.0.0.1:8081 --s3-prefix parquet/rust
+ExecStart=/usr/local/bin/coin-data-rs --exchange binance --database /var/lib/coin-data-rs/market.duckdb --api-address 127.0.0.1:8081 --s3-bucket coin-data-196920285698-ap-northeast-1-an --aws-region ap-northeast-1 --s3-prefix parquet/rust
 Restart=always
 RestartSec=5
 TimeoutStopSec=30

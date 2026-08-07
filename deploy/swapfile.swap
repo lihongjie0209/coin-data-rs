@@ -1,0 +1,9 @@
+[Unit]
+Description=Emergency swap for coin data collector
+Before=coin-data-rs.service
+
+[Swap]
+What=/swapfile
+
+[Install]
+WantedBy=swap.target

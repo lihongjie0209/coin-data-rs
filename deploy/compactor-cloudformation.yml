@@ -4,7 +4,7 @@ Description: Scheduled Parquet compaction on ARM64 ECS Fargate
 Parameters:
   BucketName:
     Type: String
-    Default: coin-data-196920285698-ap-southeast-1-an
+    Default: coin-data-196920285698-ap-northeast-1-an
   VpcId:
     Type: AWS::EC2::VPC::Id
   SubnetIds:
@@ -12,6 +12,9 @@ Parameters:
   GitHubRepositorySubject:
     Type: String
     Default: lihongjie0209@21978475/coin-data-rs@1321170332
+  GitHubOidcProviderArn:
+    Type: String
+    Default: arn:aws:iam::196920285698:oidc-provider/token.actions.githubusercontent.com
 
 Resources:
   Repository:
@@ -24,22 +27,16 @@ Resources:
         ScanOnPush: true
       ImageTagMutability: MUTABLE
 
-  GitHubOidcProvider:
-    Type: AWS::IAM::OIDCProvider
-    Properties:
-      Url: https://token.actions.githubusercontent.com
-      ClientIdList: [sts.amazonaws.com]
-
   GitHubRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: coin-data-compactor-github
+      RoleName: coin-data-compactor-github-tokyo
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement:
           - Effect: Allow
             Principal:
-              Federated: !Ref GitHubOidcProvider
+              Federated: !Ref GitHubOidcProviderArn
             Action: sts:AssumeRoleWithWebIdentity
             Condition:
               StringEquals:
@@ -68,7 +65,7 @@ Resources:
   Cluster:
     Type: AWS::ECS::Cluster
     Properties:
-      ClusterName: coin-data-batch
+      ClusterName: coin-data-batch-tokyo
       CapacityProviders: [FARGATE, FARGATE_SPOT]
       DefaultCapacityProviderStrategy:
         - CapacityProvider: FARGATE
@@ -77,14 +74,14 @@ Resources:
   LogGroup:
     Type: AWS::Logs::LogGroup
     Properties:
-      LogGroupName: /ecs/coin-data-parquet-compactor
+      LogGroupName: /ecs/coin-data-parquet-compactor-tokyo
       RetentionInDays: 14
 
   SecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
       GroupDescription: Egress-only access for Parquet compactor
-      GroupName: coin-data-parquet-compactor
+      GroupName: coin-data-parquet-compactor-tokyo
       VpcId: !Ref VpcId
       SecurityGroupEgress:
         - IpProtocol: '-1'
@@ -93,7 +90,7 @@ Resources:
   TaskExecutionRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: coin-data-compactor-execution
+      RoleName: coin-data-compactor-execution-tokyo
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement:
@@ -107,7 +104,7 @@ Resources:
   TaskRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: coin-data-compactor-task
+      RoleName: coin-data-compactor-task-tokyo
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement:
@@ -144,7 +141,7 @@ Resources:
   TaskDefinition:
     Type: AWS::ECS::TaskDefinition
     Properties:
-      Family: coin-data-parquet-compactor
+      Family: coin-data-parquet-compactor-tokyo
       Cpu: '1024'
       Memory: '2048'
       NetworkMode: awsvpc
@@ -169,13 +166,13 @@ Resources:
   DeadLetterQueue:
     Type: AWS::SQS::Queue
     Properties:
-      QueueName: coin-data-parquet-compactor-dlq
+      QueueName: coin-data-parquet-compactor-dlq-tokyo
       MessageRetentionPeriod: 1209600
 
   SchedulerRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: coin-data-compactor-scheduler
+      RoleName: coin-data-compactor-scheduler-tokyo
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement:
@@ -203,7 +200,7 @@ Resources:
   Schedule:
     Type: AWS::Scheduler::Schedule
     Properties:
-      Name: coin-data-parquet-compactor-8h
+      Name: coin-data-parquet-compactor-8h-tokyo
       Description: Scan and compact completed Parquet partitions every eight hours
       State: ENABLED
       ScheduleExpression: cron(15 0/8 * * ? *)
