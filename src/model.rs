@@ -1,5 +1,7 @@
 use chrono::{DateTime, Utc};
 
+use crate::config::Market;
+
 #[derive(Debug, Clone)]
 pub enum Value {
     Null,
@@ -32,6 +34,7 @@ impl Value {
 pub struct Record {
     pub table: &'static str,
     pub values: Vec<Value>,
+    pub target_market: Option<Market>,
 }
 
 pub fn timestamp(value: DateTime<Utc>) -> Value {

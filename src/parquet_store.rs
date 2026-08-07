@@ -310,6 +310,7 @@ mod tests {
                 Value::Boolean(true),
                 text("history-test"),
             ],
+            target_market: None,
         }];
         let segment = write_segment(
             directory.path(),

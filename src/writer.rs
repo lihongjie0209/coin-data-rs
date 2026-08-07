@@ -505,6 +505,7 @@ mod tests {
                         Value::Boolean(true),
                         text("queue-test"),
                     ],
+                    target_market: None,
                 }],
             )
             .await?;

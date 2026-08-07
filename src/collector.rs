@@ -7,7 +7,9 @@ use futures_util::{SinkExt, StreamExt};
 use tokio::sync::mpsc;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
-use crate::{config::Market, futures_parser, parser, runtime::Metrics, writer::Writer};
+use crate::{
+    config::Market, futures_parser, model::Record, parser, runtime::Metrics, writer::Writer,
+};
 
 const METRICS_FLUSH_MESSAGES: u64 = 256;
 const METRICS_FLUSH_INTERVAL: Duration = Duration::from_secs(1);
@@ -235,9 +237,45 @@ async fn process_payloads(
             .parsed_records
             .fetch_add(parsed_records, std::sync::atomic::Ordering::Relaxed);
         if !record_batch.is_empty() {
-            writer.records(market, record_batch).await?;
+            write_records(&writer, market, record_batch).await?;
         }
     }
+}
+
+async fn write_records(
+    writer: &Writer,
+    fallback_market: Market,
+    records: Vec<Record>,
+) -> Result<()> {
+    let needs_routing = records.iter().any(|record| {
+        record
+            .target_market
+            .is_some_and(|target| target != fallback_market)
+    });
+    if !needs_routing {
+        return writer.records(fallback_market, records).await;
+    }
+
+    let mut spot = Vec::new();
+    let mut usdm = Vec::new();
+    let mut coinm = Vec::new();
+    for record in records {
+        match record.target_market.unwrap_or(fallback_market) {
+            Market::Spot => spot.push(record),
+            Market::Usdm => usdm.push(record),
+            Market::Coinm => coinm.push(record),
+        }
+    }
+    for (market, records) in [
+        (Market::Spot, spot),
+        (Market::Usdm, usdm),
+        (Market::Coinm, coinm),
+    ] {
+        if !records.is_empty() {
+            writer.records(market, records).await?;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

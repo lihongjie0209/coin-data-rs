@@ -227,7 +227,11 @@ fn parse_kline(data: &Event<'_>, received: DateTime<Utc>, source: &'static str) 
 }
 
 fn record(table: &'static str, values: Vec<DataValue>) -> Record {
-    Record { table, values }
+    Record {
+        table,
+        values,
+        target_market: None,
+    }
 }
 
 fn decimal(raw: Option<&serde_json::value::RawValue>) -> DataValue {

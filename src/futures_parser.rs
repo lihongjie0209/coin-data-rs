@@ -4,6 +4,7 @@ use serde_json::{Value, value::RawValue};
 
 use crate::{
     binance_json::{self, Event},
+    config::Market,
     model::{
         Record, Value as DataValue, decimal as data_decimal, parse_decimal, static_text, text,
         timestamp,
@@ -72,6 +73,7 @@ pub fn parse_open_interest(
             decimal_value(rest_string(data, "openInterest")),
             static_text(source),
         ],
+        target_market: None,
     }
 }
 
@@ -87,10 +89,12 @@ fn parse_depth(data: &Event<'_>, received: DateTime<Utc>, source: &'static str) 
             uint(data.first_update),
             uint(data.u),
             uint(data.pu),
-            static_text(source),
             text(binance_json::json(data.b)),
             text(binance_json::json(data.a)),
+            optional_integer(data.st),
+            static_text(source),
         ],
+        target_market: target_market(data),
     }
 }
 
@@ -105,12 +109,15 @@ fn aggregate_trade(data: &Event<'_>, received: DateTime<Utc>, source: &'static s
             uint(data.a),
             decimal(data.p),
             decimal(data.q),
+            decimal(data.nq),
             uint(data.f),
             uint(data.l),
             millis(data.transaction_time, received),
             boolean(data.m),
+            optional_integer(data.st),
             static_text(source),
         ],
+        target_market: target_market(data),
     }
 }
 
@@ -128,8 +135,10 @@ fn book_ticker(data: &Event<'_>, received: DateTime<Utc>, source: &'static str) 
             decimal(data.a),
             decimal(data.upper_a),
             text(binance_json::string(data.ps)),
+            optional_integer(data.st),
             static_text(source),
         ],
+        target_market: target_market(data),
     }
 }
 
@@ -146,8 +155,10 @@ fn mark_price(data: &Event<'_>, received: DateTime<Utc>, source: &'static str) -
             decimal(data.upper_p),
             decimal(data.r),
             millis(data.transaction_time, received),
+            optional_integer(data.st),
             static_text(source),
         ],
+        target_market: target_market(data),
     }
 }
 
@@ -170,8 +181,10 @@ fn liquidation(data: &Event<'_>, received: DateTime<Utc>, source: &'static str) 
             decimal(order.z),
             millis(order.transaction_time, received),
             text(binance_json::string(order.ps)),
+            optional_integer(data.st.or(order.st)),
             static_text(source),
         ],
+        target_market: target_market(data).or_else(|| target_market(&order)),
     })
 }
 
@@ -189,8 +202,10 @@ fn mini_ticker(data: &Event<'_>, received: DateTime<Utc>, source: &'static str) 
             decimal(data.l),
             decimal(data.v),
             decimal(data.q),
+            optional_integer(data.st),
             static_text(source),
         ],
+        target_market: target_market(data),
     }
 }
 
@@ -217,8 +232,10 @@ fn ticker(data: &Event<'_>, received: DateTime<Utc>, source: &'static str) -> Re
             integer(data.upper_f),
             integer(data.upper_l),
             uint(data.n),
+            optional_integer(data.st),
             static_text(source),
         ],
+        target_market: target_market(data),
     }
 }
 
@@ -247,8 +264,10 @@ fn kline(data: &Event<'_>, received: DateTime<Utc>, source: &'static str) -> Res
             decimal(value.upper_v),
             decimal(value.upper_q),
             decimal(value.upper_b),
+            optional_integer(data.st.or(value.st)),
             static_text(source),
         ],
+        target_market: target_market(data).or_else(|| target_market(&value)),
     })
 }
 
@@ -269,6 +288,20 @@ fn uint(raw: Option<&RawValue>) -> DataValue {
 
 fn integer(raw: Option<&RawValue>) -> DataValue {
     DataValue::I64(binance_json::i64(raw))
+}
+
+fn optional_integer(raw: Option<&RawValue>) -> DataValue {
+    raw.map_or(DataValue::Null, |value| {
+        DataValue::I64(binance_json::i64(Some(value)))
+    })
+}
+
+fn target_market(data: &Event<'_>) -> Option<Market> {
+    match binance_json::i64(data.st) {
+        1 => Some(Market::Usdm),
+        2 => Some(Market::Coinm),
+        _ => None,
+    }
 }
 
 fn boolean(raw: Option<&RawValue>) -> DataValue {
@@ -300,11 +333,22 @@ mod tests {
 
     #[test]
     fn futures_depth_should_preserve_previous_update_id() -> Result<()> {
-        let payload = br#"{"stream":"btcusdt@depth@100ms","data":{"e":"depthUpdate","E":1785731400000,"T":1785731400001,"s":"BTCUSDT","U":10,"u":12,"pu":9,"b":[["100","1"]],"a":[["101","2"]]}}"#;
+        let payload = br#"{"stream":"btcusdt@depth@100ms","data":{"e":"depthUpdate","E":1785731400000,"T":1785731400001,"s":"BTCUSDT","U":10,"u":12,"pu":9,"b":[["100","1"]],"a":[["101","2"]],"st":2}}"#;
         let records = parse(payload, Utc::now(), "binance_usdm_websocket")?;
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].table, "futures_depth_updates");
-        assert_eq!(records[0].values.len(), 11);
+        assert_eq!(records[0].values.len(), 12);
+        assert_eq!(records[0].target_market, Some(Market::Coinm));
+        Ok(())
+    }
+
+    #[test]
+    fn aggregate_trade_should_preserve_normal_quantity_and_symbol_type() -> Result<()> {
+        let payload = br#"{"stream":"btcusdt@aggTrade","data":{"e":"aggTrade","E":1785731400000,"s":"BTCUSDT","a":1,"p":"100","q":"2","nq":"1.5","f":1,"l":2,"T":1785731400001,"m":true,"st":1}}"#;
+        let records = parse(payload, Utc::now(), "binance_usdm_websocket")?;
+
+        assert_eq!(records[0].values.len(), 14);
+        assert_eq!(records[0].target_market, Some(Market::Usdm));
         Ok(())
     }
 

@@ -92,16 +92,52 @@ pub(crate) struct Event<'a> {
     pub z: Option<&'a RawValue>,
     #[serde(default, borrow)]
     pub k: Option<&'a RawValue>,
+    #[serde(default, borrow)]
+    pub nq: Option<&'a RawValue>,
+    #[serde(default, borrow)]
+    pub st: Option<&'a RawValue>,
 }
 
-pub(crate) fn decode(payload: &[u8]) -> Result<(&str, Vec<Event<'_>>)> {
+pub(crate) struct Events<'a> {
+    one: Option<Event<'a>>,
+    many: std::vec::IntoIter<Event<'a>>,
+}
+
+impl<'a> Iterator for Events<'a> {
+    type Item = Event<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.one.take().or_else(|| self.many.next())
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let length = self.len();
+        (length, Some(length))
+    }
+}
+
+impl ExactSizeIterator for Events<'_> {
+    fn len(&self) -> usize {
+        usize::from(self.one.is_some()) + self.many.len()
+    }
+}
+
+pub(crate) fn decode(payload: &[u8]) -> Result<(&str, Events<'_>)> {
     let envelope: Envelope<'_> =
         serde_json::from_slice(payload).context("decode websocket envelope")?;
     let event_payload = envelope.data.map_or(payload, |data| data.get().as_bytes());
     let events = if event_payload.first() == Some(&b'[') {
-        serde_json::from_slice(event_payload).context("decode websocket event array")?
+        let events: Vec<Event<'_>> =
+            serde_json::from_slice(event_payload).context("decode websocket event array")?;
+        Events {
+            one: None,
+            many: events.into_iter(),
+        }
     } else {
-        vec![serde_json::from_slice(event_payload).context("decode websocket event")?]
+        Events {
+            one: Some(serde_json::from_slice(event_payload).context("decode websocket event")?),
+            many: Vec::new().into_iter(),
+        }
     };
     Ok((envelope.stream, events))
 }
@@ -152,12 +188,13 @@ mod tests {
 
     #[test]
     fn decode_should_borrow_combined_stream_fields() -> Result<()> {
-        let (stream, events) = decode(
+        let (stream, mut events) = decode(
             br#"{"stream":"btcusdt@trade","data":{"e":"trade","E":12,"s":"BTCUSDT","p":"1.25"}}"#,
         )?;
+        let event = events.next().context("missing event")?;
 
         assert_eq!(
-            (stream, string(events[0].e), string(events[0].s)),
+            (stream, string(event.e), string(event.s)),
             ("btcusdt@trade", "trade", "BTCUSDT")
         );
         Ok(())
@@ -165,9 +202,10 @@ mod tests {
 
     #[test]
     fn decode_should_support_raw_events() -> Result<()> {
-        let (stream, events) = decode(br#"{"e":"bookTicker","u":7,"s":"BTCUSDT"}"#)?;
+        let (stream, mut events) = decode(br#"{"e":"bookTicker","u":7,"s":"BTCUSDT"}"#)?;
+        let event = events.next().context("missing event")?;
 
-        assert_eq!((stream, u64(events[0].u)), ("", 7));
+        assert_eq!((stream, u64(event.u)), ("", 7));
         Ok(())
     }
 

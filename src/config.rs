@@ -5,8 +5,8 @@ use clap::{Parser, ValueEnum};
 
 pub const DEFAULT_SYMBOLS: &str = "ALL";
 pub const DEFAULT_STREAMS: &str = "depth@100ms,aggTrade,trade,kline_1s,!miniTicker@arr,ticker,!ticker_1h@arr,!ticker_4h@arr,!ticker_1d@arr,bookTicker,avgPrice";
-pub const DEFAULT_FUTURES_STREAMS: &str =
-    "depth@100ms,aggTrade,kline_1m,miniTicker,ticker,!bookTicker,!markPrice@arr@1s,!forceOrder@arr";
+pub const DEFAULT_USDM_STREAMS: &str = "depth@100ms,aggTrade,kline_1m,!miniTicker@arr,!ticker@arr,!bookTicker,!markPrice@arr@1s,!forceOrder@arr";
+pub const DEFAULT_COINM_STREAMS: &str = "depth@100ms,aggTrade,kline_1m";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StreamGroup {
@@ -266,10 +266,10 @@ impl Config {
     }
 
     pub fn streams(&self) -> Vec<String> {
-        let defaults = if self.exchange == Exchange::Binance && self.market != Market::Spot {
-            DEFAULT_FUTURES_STREAMS
-        } else {
-            DEFAULT_STREAMS
+        let defaults = match (self.exchange, self.market) {
+            (Exchange::Binance, Market::Usdm) => DEFAULT_USDM_STREAMS,
+            (Exchange::Binance, Market::Coinm) => DEFAULT_COINM_STREAMS,
+            _ => DEFAULT_STREAMS,
         };
         csv(self.streams.as_deref().unwrap_or(defaults), false)
     }
@@ -499,5 +499,19 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn coinm_should_not_subscribe_to_merged_futures_streams() {
+        let config = Config::parse_from(["coin-data-rs", "--all-markets=false", "--market=coinm"]);
+
+        assert_eq!(config.streams(), ["depth@100ms", "aggTrade", "kline_1m"]);
+    }
+
+    #[test]
+    fn usdm_should_subscribe_to_merged_futures_streams_once() {
+        let config = Config::parse_from(["coin-data-rs", "--all-markets=false", "--market=usdm"]);
+
+        assert!(config.streams().contains(&"!bookTicker".to_owned()));
     }
 }
