@@ -155,7 +155,12 @@ Resources:
         - Name: compactor
           Essential: true
           Image: !Sub ${AWS::AccountId}.dkr.ecr.${AWS::Region}.${AWS::URLSuffix}/coin-data-parquet-compactor:latest
-          Command: [--execute]
+          Command:
+            - --execute
+            - --bucket
+            - !Ref BucketName
+            - --region
+            - !Ref AWS::Region
           LogConfiguration:
             LogDriver: awslogs
             Options:
