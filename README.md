@@ -46,6 +46,12 @@ The release includes `parquet-bench`. It repeatedly reads historical Parquet bat
 parquet-bench --source /path/to/history --output /tmp/parquet-bench --seconds 60
 ```
 
+Parser changes can be measured locally against fixed Spot and Futures websocket payloads with Criterion:
+
+```bash
+cargo bench --bench parser_replay
+```
+
 ## Scheduled compaction
 
 `parquet-compact` scans completed hourly S3 partitions and merges eligible `segment-*.parquet` objects with bounded Arrow batches. It reorders each bounded batch by symbol and event time, writes one-million-row groups with ZSTD level 3, and remains dry-run by default; `--execute` enables writes. Successful runs store `compacted.parquet` in S3 Intelligent-Tiering, copy source objects to `parquet/compaction-source/`, publish a success marker, and then remove the small objects from the production prefix. S3 Lifecycle retains the copied sources for one day.

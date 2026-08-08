@@ -1,4 +1,5 @@
 use chrono::{DateTime, Utc};
+use compact_str::CompactString;
 
 use crate::config::Market;
 
@@ -6,7 +7,7 @@ use crate::config::Market;
 pub enum Value {
     Null,
     TimestampMicros(i64),
-    Text(String),
+    Text(CompactString),
     StaticText(&'static str),
     U64(u64),
     I64(i64),
@@ -18,7 +19,8 @@ impl Value {
     pub fn estimated_bytes(&self) -> usize {
         std::mem::size_of::<Self>()
             + match self {
-                Self::Text(value) => value.capacity(),
+                Self::Text(value) if value.is_heap_allocated() => value.capacity(),
+                Self::Text(_) => 0,
                 Self::StaticText(value) => value.len(),
                 Self::Null
                 | Self::TimestampMicros(_)
@@ -41,8 +43,8 @@ pub fn timestamp(value: DateTime<Utc>) -> Value {
     Value::TimestampMicros(value.timestamp_micros())
 }
 
-pub fn text(value: impl Into<String>) -> Value {
-    Value::Text(value.into())
+pub fn text(value: impl AsRef<str>) -> Value {
+    Value::Text(CompactString::new(value.as_ref()))
 }
 
 pub const fn static_text(value: &'static str) -> Value {
