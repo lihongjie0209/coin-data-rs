@@ -123,9 +123,7 @@ impl ExactSizeIterator for Events<'_> {
 }
 
 pub(crate) fn decode(payload: &[u8]) -> Result<(&str, Events<'_>)> {
-    let envelope: Envelope<'_> =
-        serde_json::from_slice(payload).context("decode websocket envelope")?;
-    let event_payload = envelope.data.map_or(payload, |data| data.get().as_bytes());
+    let (stream, event_payload) = websocket_payload(payload)?;
     let events = if event_payload.first() == Some(&b'[') {
         let events: Vec<Event<'_>> =
             serde_json::from_slice(event_payload).context("decode websocket event array")?;
@@ -139,7 +137,30 @@ pub(crate) fn decode(payload: &[u8]) -> Result<(&str, Events<'_>)> {
             many: Vec::new().into_iter(),
         }
     };
-    Ok((envelope.stream, events))
+    Ok((stream, events))
+}
+
+fn websocket_payload(payload: &[u8]) -> Result<(&str, &[u8])> {
+    if let Some(combined) = combined_payload(payload) {
+        return Ok(combined);
+    }
+    let envelope: Envelope<'_> =
+        serde_json::from_slice(payload).context("decode websocket envelope")?;
+    let event_payload = envelope.data.map_or(payload, |data| data.get().as_bytes());
+    Ok((envelope.stream, event_payload))
+}
+
+fn combined_payload(payload: &[u8]) -> Option<(&str, &[u8])> {
+    const PREFIX: &[u8] = br#"{"stream":""#;
+    const DATA_SEPARATOR: &[u8] = br#"","data":"#;
+
+    let rest = payload.strip_prefix(PREFIX)?;
+    let stream_end = rest.iter().position(|byte| *byte == b'"')?;
+    let stream = std::str::from_utf8(&rest[..stream_end]).ok()?;
+    let event_payload = rest[stream_end..]
+        .strip_prefix(DATA_SEPARATOR)?
+        .strip_suffix(b"}")?;
+    (!event_payload.is_empty()).then_some((stream, event_payload))
 }
 
 pub(crate) fn decode_nested(raw: Option<&RawValue>) -> Result<Event<'_>> {
@@ -216,6 +237,26 @@ mod tests {
         )?;
 
         assert_eq!(events.len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn combined_payload_should_borrow_fixed_binance_envelope() {
+        let payload = br#"{"stream":"btcusdt@trade","data":{"e":"trade"}}"#;
+
+        assert_eq!(
+            combined_payload(payload),
+            Some(("btcusdt@trade", br#"{"e":"trade"}"#.as_slice()))
+        );
+    }
+
+    #[test]
+    fn decode_should_fall_back_for_envelope_with_whitespace() -> Result<()> {
+        let (stream, mut events) =
+            decode(br#"{ "data": {"e":"trade"}, "stream": "btcusdt@trade" }"#)?;
+        let event = events.next().context("missing event")?;
+
+        assert_eq!((stream, string(event.e)), ("btcusdt@trade", "trade"));
         Ok(())
     }
 }

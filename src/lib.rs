@@ -1,3 +1,6 @@
+#[global_allocator]
+static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 pub mod api;
 pub mod archive;
 mod binance_json;

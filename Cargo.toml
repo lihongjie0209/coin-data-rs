@@ -25,6 +25,7 @@ clap = { version = "4.5", features = ["derive", "env"] }
 compact_str = "0.9"
 futures-util = "0.3"
 fs2 = "0.4"
+mimalloc = { version = "0.1", default-features = false }
 parquet = { version = "59.1", features = ["arrow", "zstd"] }
 reqwest = { version = "0.13", default-features = false, features = ["json", "query", "rustls"] }
 serde = { version = "1.0", features = ["derive"] }
