@@ -12,6 +12,16 @@ cargo run --release -- --database data/market
 
 The parent of `--database` is the data root. `--buffer-mb` and `--segment-mb` default to automatic sizing; a positive value forces an explicit size. Queue and time limits can be changed with `--queue-capacity` and `--flush-seconds`. All currently tradable instruments and all three Binance markets are enabled by default. Aggregate-trade REST backfill remains disabled.
 
+The Binance depth snapshot scheduler is enabled by default and runs independently of WebSocket ingestion. It staggers symbols across each interval, limits concurrent REST calls with `--snapshot-concurrency`, and accounts for Binance request weights (`--snapshot-depth-limit`). A weighted token bucket reserves 20% headroom and adapts to the `X-MBX-USED-WEIGHT-1M` response header; HTTP 429/418 responses pause the scheduler without stopping WebSocket writers. Set `--snapshot-enabled=false` to disable it, or tune `--snapshot-interval-seconds`, `--snapshot-depth-limit`, and `--snapshot-prefix`.
+
+Snapshots are compressed JSON objects containing the complete REST response plus `captured_at`, `requested_at`, `last_update_id`, market, symbol, and requested depth. They are stored independently from Parquet increments:
+
+```text
+snapshots/rust/binance/spot/BTCUSDT/date=2026-08-04/hour=00/snapshot-20260804T001500.123Z-u123456789.json.zst
+```
+
+To reconstruct an order book for a target time, select the newest snapshot whose `captured_at` is at or before the target, apply depth-update rows after its `last_update_id`, and verify Binance `U/u/pu` continuity. If the first update does not bridge the snapshot ID, that window requires a newer snapshot; the collector does not claim historical completeness without this continuity check.
+
 Segments use the following local and S3 layout:
 
 ```text

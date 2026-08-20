@@ -30,6 +30,7 @@ parquet = { version = "59.1", features = ["arrow", "zstd"] }
 reqwest = { version = "0.13", default-features = false, features = ["json", "query", "rustls"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0", features = ["raw_value"] }
+zstd = "0.13"
 tokio = { version = "1.49", features = ["full"] }
 tokio-tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
 tower-http = { version = "0.6", features = ["trace"] }

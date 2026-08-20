@@ -130,6 +130,16 @@ pub struct Config {
     pub max_retention_hours: u64,
     #[arg(long, default_value_t = 20)]
     pub min_free_disk_percent: u64,
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    pub snapshot_enabled: bool,
+    #[arg(long, default_value_t = 3600)]
+    pub snapshot_interval_seconds: u64,
+    #[arg(long, default_value_t = 500)]
+    pub snapshot_depth_limit: u16,
+    #[arg(long, default_value_t = 8)]
+    pub snapshot_concurrency: usize,
+    #[arg(long, default_value = "snapshots/rust")]
+    pub snapshot_prefix: String,
 }
 
 impl Config {
@@ -170,6 +180,17 @@ impl Config {
         if self.min_free_disk_percent > 100 {
             bail!("minimum free disk percent must be <= 100");
         }
+        if self.snapshot_interval_seconds == 0 {
+            bail!("snapshot interval must be positive");
+        }
+        if !matches!(
+            self.snapshot_depth_limit,
+            5 | 10 | 20 | 50 | 100 | 500 | 1000 | 5000
+        ) {
+            bail!("snapshot depth limit is not supported by Binance");
+        }
+        NonZeroUsize::new(self.snapshot_concurrency)
+            .ok_or_else(|| anyhow::anyhow!("snapshot concurrency must be positive"))?;
         Ok(())
     }
 
