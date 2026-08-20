@@ -10,6 +10,7 @@ use coin_data_rs::{
     futures_poll::OpenInterestPoller,
     notify::TelegramNotifier,
     runtime::Metrics,
+    snapshot::SnapshotSyncer,
     writer::{Writer, WriterSettings},
 };
 use tokio::net::TcpListener;
@@ -90,6 +91,11 @@ async fn start_dataset(config: Config, writer: Writer, metrics: Arc<Metrics>) ->
             writer.clone(),
         )
         .spawn();
+    }
+    if config.exchange == coin_data_rs::config::Exchange::Binance && config.snapshot_enabled {
+        SnapshotSyncer::new(config.clone(), config.market, symbols.clone())
+            .await
+            .spawn();
     }
     let mut shard_id = 0;
     let payload_sender = collector::start_processor(writer, Arc::clone(&metrics), config.market);
