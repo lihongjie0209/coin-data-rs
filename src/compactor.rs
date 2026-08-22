@@ -11,7 +11,7 @@ use aws_sdk_s3::{
     primitives::ByteStream,
     types::{Delete, ObjectIdentifier, StorageClass},
 };
-use chrono::{DateTime, NaiveDateTime, TimeDelta, Utc};
+use chrono::{DateTime, NaiveDate, NaiveDateTime, TimeDelta, Utc};
 use clap::Parser;
 use parquet::{
     arrow::{ArrowWriter, arrow_reader::ParquetRecordBatchReaderBuilder},
@@ -42,6 +42,18 @@ pub struct Options {
     pub small_file_mb: u64,
     #[arg(long, default_value_t = 10)]
     pub settle_minutes: i64,
+    #[arg(
+        long,
+        default_value_t = 48,
+        help = "only discover hourly prefixes within this many hours"
+    )]
+    pub lookback_hours: i64,
+    #[arg(
+        long,
+        default_value = "parquet/compaction-source-control/checkpoint.json",
+        help = "S3 key used to persist completed partition fingerprints"
+    )]
+    pub checkpoint_key: String,
     #[arg(long, default_value_t = 262_144)]
     pub batch_rows: usize,
     #[arg(
@@ -79,6 +91,40 @@ struct Completion {
     rows: u64,
 }
 
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct Checkpoint {
+    version: u8,
+    updated_at: Option<DateTime<Utc>>,
+    partitions: BTreeMap<String, PartitionCheckpoint>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct PartitionCheckpoint {
+    hour: DateTime<Utc>,
+    source_keys: Vec<String>,
+    source_bytes: u64,
+    completed_at: DateTime<Utc>,
+}
+
+impl PartitionCheckpoint {
+    fn matches(&self, partition: &Partition) -> bool {
+        let mut keys = partition
+            .sources
+            .iter()
+            .map(|source| source.key.clone())
+            .collect::<Vec<_>>();
+        keys.sort_unstable();
+        self.hour == partition.hour
+            && self.source_bytes
+                == partition
+                    .sources
+                    .iter()
+                    .map(|source| source.bytes)
+                    .sum::<u64>()
+            && self.source_keys == keys
+    }
+}
+
 pub struct Compactor {
     options: Options,
     client: Client,
@@ -108,7 +154,8 @@ impl Compactor {
     }
 
     async fn run_partitions(&self) -> Result<()> {
-        let mut partitions = self.candidates().await?;
+        let mut checkpoint = self.load_checkpoint().await?;
+        let mut partitions = self.candidates(&checkpoint).await?;
         partitions.sort_by_key(|partition| partition.hour);
         if self.options.max_partitions > 0 {
             partitions.truncate(self.options.max_partitions);
@@ -133,9 +180,73 @@ impl Compactor {
             return Ok(());
         }
         for partition in partitions {
+            let partition_key = partition.prefix.clone();
+            let mut source_keys = partition
+                .sources
+                .iter()
+                .map(|source| source.key.clone())
+                .collect::<Vec<_>>();
+            source_keys.sort_unstable();
+            let entry = PartitionCheckpoint {
+                hour: partition.hour,
+                source_keys,
+                source_bytes: partition.sources.iter().map(|source| source.bytes).sum(),
+                completed_at: Utc::now(),
+            };
             self.compact(partition).await?;
+            checkpoint.partitions.insert(partition_key, entry);
+            checkpoint.updated_at = Some(Utc::now());
+            self.save_checkpoint(&checkpoint).await?;
         }
+        self.prune_checkpoint(&mut checkpoint);
+        self.save_checkpoint(&checkpoint).await?;
         Ok(())
+    }
+
+    async fn load_checkpoint(&self) -> Result<Checkpoint> {
+        match self
+            .client
+            .get_object()
+            .bucket(&self.options.bucket)
+            .key(&self.options.checkpoint_key)
+            .send()
+            .await
+        {
+            Ok(response) => {
+                let bytes = response.body.collect().await?.into_bytes();
+                serde_json::from_slice(&bytes).context("decode compaction checkpoint")
+            }
+            Err(error)
+                if error
+                    .as_service_error()
+                    .is_some_and(|value| value.meta().code() == Some("NoSuchKey")) =>
+            {
+                Ok(Checkpoint {
+                    version: 1,
+                    ..Checkpoint::default()
+                })
+            }
+            Err(error) => Err(error).context("load compaction checkpoint"),
+        }
+    }
+
+    async fn save_checkpoint(&self, checkpoint: &Checkpoint) -> Result<()> {
+        self.client
+            .put_object()
+            .bucket(&self.options.bucket)
+            .key(&self.options.checkpoint_key)
+            .body(ByteStream::from(serde_json::to_vec(checkpoint)?))
+            .send()
+            .await
+            .context("save compaction checkpoint")?;
+        Ok(())
+    }
+
+    fn prune_checkpoint(&self, checkpoint: &mut Checkpoint) {
+        let cutoff = Utc::now() - TimeDelta::hours(self.options.lookback_hours + 24);
+        checkpoint
+            .partitions
+            .retain(|_, entry| entry.hour >= cutoff);
     }
 
     async fn acquire_lock(&self) -> Result<String> {
@@ -190,46 +301,49 @@ impl Compactor {
         Ok(())
     }
 
-    async fn candidates(&self) -> Result<Vec<Partition>> {
-        let prefix = format!("{}/", self.options.prefix.trim_matches('/'));
+    async fn candidates(&self, checkpoint: &Checkpoint) -> Result<Vec<Partition>> {
         let cutoff = Utc::now() - TimeDelta::minutes(self.options.settle_minutes);
         let mut grouped = BTreeMap::<String, Partition>::new();
-        let mut pages = self
-            .client
-            .list_objects_v2()
-            .bucket(&self.options.bucket)
-            .prefix(&prefix)
-            .into_paginator()
-            .send();
-        while let Some(page) = pages.next().await {
-            let page = page.context("list Parquet objects")?;
-            for object in page.contents() {
-                let Some(key) = object.key() else {
-                    continue;
-                };
-                if !is_source_key(key) {
-                    continue;
+        let window_start = Utc::now() - TimeDelta::hours(self.options.lookback_hours);
+        for hour_prefix in self.recent_hour_prefixes(window_start).await? {
+            let mut pages = self
+                .client
+                .list_objects_v2()
+                .bucket(&self.options.bucket)
+                .prefix(&hour_prefix)
+                .into_paginator()
+                .send();
+            while let Some(page) = pages.next().await {
+                let page = page.context("list Parquet objects")?;
+                for object in page.contents() {
+                    let Some(key) = object.key() else {
+                        continue;
+                    };
+                    if !is_source_key(key) {
+                        continue;
+                    }
+                    let Some((partition_prefix, hour)) = partition_from_key(key) else {
+                        tracing::warn!(%key, "ignore object outside an hourly partition");
+                        continue;
+                    };
+                    if hour + TimeDelta::hours(1) > cutoff {
+                        continue;
+                    }
+                    let bytes =
+                        u64::try_from(object.size().unwrap_or_default()).unwrap_or_default();
+                    let partition =
+                        grouped
+                            .entry(partition_prefix.clone())
+                            .or_insert_with(|| Partition {
+                                prefix: partition_prefix,
+                                hour,
+                                sources: Vec::new(),
+                            });
+                    partition.sources.push(Source {
+                        key: key.to_owned(),
+                        bytes,
+                    });
                 }
-                let Some((partition_prefix, hour)) = partition_from_key(key) else {
-                    tracing::warn!(%key, "ignore object outside an hourly partition");
-                    continue;
-                };
-                if hour + TimeDelta::hours(1) > cutoff {
-                    continue;
-                }
-                let bytes = u64::try_from(object.size().unwrap_or_default()).unwrap_or_default();
-                let partition =
-                    grouped
-                        .entry(partition_prefix.clone())
-                        .or_insert_with(|| Partition {
-                            prefix: partition_prefix,
-                            hour,
-                            sources: Vec::new(),
-                        });
-                partition.sources.push(Source {
-                    key: key.to_owned(),
-                    bytes,
-                });
             }
         }
         let small_limit = self.options.small_file_mb.saturating_mul(1_024 * 1_024);
@@ -244,7 +358,77 @@ impl Compactor {
                 partition.sources.len() >= self.options.minimum_files
                     || small >= self.options.minimum_small_files
             })
+            .filter(|partition| {
+                !checkpoint
+                    .partitions
+                    .get(&partition.prefix)
+                    .is_some_and(|entry| entry.matches(partition))
+            })
             .collect())
+    }
+
+    async fn recent_hour_prefixes(&self, window_start: DateTime<Utc>) -> Result<Vec<String>> {
+        let root = format!("{}/", self.options.prefix.trim_matches('/'));
+        let mut dates = Vec::new();
+        self.find_date_prefixes(&root, window_start.date_naive(), 0, &mut dates)
+            .await?;
+        let mut hours = Vec::new();
+        for date_prefix in dates {
+            hours.extend(self.list_common_prefixes(&date_prefix).await?);
+        }
+        Ok(hours)
+    }
+
+    async fn find_date_prefixes(
+        &self,
+        prefix: &str,
+        first_date: NaiveDate,
+        depth: usize,
+        dates: &mut Vec<String>,
+    ) -> Result<()> {
+        // The producer currently uses exchange/table/date/hour, but walking
+        // prefixes keeps this compatible with additional table dimensions.
+        let mut pending = vec![(prefix.to_owned(), depth)];
+        while let Some((current, current_depth)) = pending.pop() {
+            if current_depth > 8 {
+                continue;
+            }
+            for child in self.list_common_prefixes(&current).await? {
+                let component = child
+                    .trim_end_matches('/')
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or_default();
+                if let Some(date) = parse_date_component(component) {
+                    if date >= first_date {
+                        dates.push(child);
+                    }
+                } else {
+                    pending.push((child, current_depth + 1));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn list_common_prefixes(&self, prefix: &str) -> Result<Vec<String>> {
+        let mut result = Vec::new();
+        let mut pages = self
+            .client
+            .list_objects_v2()
+            .bucket(&self.options.bucket)
+            .prefix(prefix)
+            .delimiter("/")
+            .into_paginator()
+            .send();
+        while let Some(page) = pages.next().await {
+            for common in page.context("list S3 prefixes")?.common_prefixes() {
+                if let Some(value) = common.prefix() {
+                    result.push(value.to_owned());
+                }
+            }
+        }
+        Ok(result)
     }
 
     async fn compact(&self, mut partition: Partition) -> Result<()> {
@@ -463,6 +647,8 @@ fn validate(options: &Options) -> Result<()> {
         || options.small_file_mb == 0
         || options.batch_rows == 0
         || options.settle_minutes < 0
+        || options.lookback_hours <= 0
+        || options.checkpoint_key.trim_matches('/').is_empty()
     {
         bail!("compaction limits must be positive");
     }
@@ -517,6 +703,11 @@ fn is_source_key(key: &str) -> bool {
             .rsplit('/')
             .next()
             .is_some_and(|name| name.starts_with("segment-"))
+}
+
+fn parse_date_component(component: &str) -> Option<NaiveDate> {
+    let value = component.strip_prefix("date=").unwrap_or(component);
+    NaiveDate::parse_from_str(value, "%Y-%m-%d").ok()
 }
 
 fn partition_from_key(key: &str) -> Option<(String, DateTime<Utc>)> {

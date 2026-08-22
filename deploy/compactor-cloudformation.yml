@@ -9,6 +9,9 @@ Parameters:
     Type: AWS::EC2::VPC::Id
   SubnetIds:
     Type: List<AWS::EC2::Subnet::Id>
+  RouteTableIds:
+    Type: CommaDelimitedList
+    Default: rtb-0620e4e89e7218b6c
   GitHubRepositorySubject:
     Type: String
     Default: lihongjie0209@21978475/coin-data-rs@1321170332
@@ -87,6 +90,29 @@ Resources:
         - IpProtocol: '-1'
           CidrIp: 0.0.0.0/0
 
+  S3GatewayEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VpcId
+      VpcEndpointType: Gateway
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.s3
+      RouteTableIds: !Ref RouteTableIds
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowCoinDataBucket
+            Effect: Allow
+            Principal: '*'
+            Action:
+              - s3:GetBucketLocation
+              - s3:ListBucket
+              - s3:GetObject
+              - s3:PutObject
+              - s3:DeleteObject
+            Resource:
+              - !Sub arn:${AWS::Partition}:s3:::${BucketName}
+              - !Sub arn:${AWS::Partition}:s3:::${BucketName}/*
+
   TaskExecutionRole:
     Type: AWS::IAM::Role
     Properties:
@@ -161,6 +187,10 @@ Resources:
             - !Ref BucketName
             - --region
             - !Ref AWS::Region
+            - --lookback-hours
+            - '48'
+            - --checkpoint-key
+            - parquet/compaction-source-control/checkpoint.json
           LogConfiguration:
             LogDriver: awslogs
             Options:
